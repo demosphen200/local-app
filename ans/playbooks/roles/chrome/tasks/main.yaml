@@ -1,0 +1,23 @@
+---
+- name: Add Google Chrome signing key
+  ansible.builtin.apt_key:
+    url: https://dl-ssl.google.com/linux/linux_signing_key.pub
+    state: present
+
+- name: Add Google Chrome repository
+  ansible.builtin.apt_repository:
+    repo: "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main"
+    state: present
+    filename: google-chrome
+    update_cache: no
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Install Google Chrome Stable
+  ansible.builtin.apt:
+    name: google-chrome-stable
+    state: present
+    install_recommends: no

@@ -12,11 +12,24 @@
       delegate_to: localhost
       run_once: true
 
+    - name: Debug raw version info
+      debug:
+      msg: "Raw version info: {{ goland_release.content }}"
+
+
     - name: Extract latest version
       set_fact:
         goland_version: "{{ (goland_release.content | from_json).GO[0].version }}"
       delegate_to: localhost
       run_once: true
+
+    - name: Debug version details
+      debug:
+      msg: |
+        Detected GoLand version: {{ goland_version }}
+        Build number: {{ goland_build }}
+        Release date: {{ goland_release_date }}
+        Download URL: {{ (goland_release.content | from_json).GO[0].downloads.linux.link }}
 
     - name: Download GoLand tarball
       get_url:
@@ -25,21 +38,21 @@
         mode: '0755'
         timeout: 60
 
-    - name: Remove previous installation if exists
-      file:
-        path: "/opt/GoLand-{{ goland_version }}"
-        state: absent
+    #- name: Remove previous installation if exists
+    #  file:
+    #    path: "/opt/GoLand-{{ goland_version }}"
+    #    state: absent
 
-    - name: Extract GoLand to /opt
-      become: true
-      unarchive:
-        src: "/tmp/goland-{{ goland_version }}.tar.gz"
-        dest: "/opt/"
-        remote_src: yes
-        extra_opts: ["--strip-components=1"]
-        mode: '0755'
+    #- name: Extract GoLand to /opt
+    #  become: true
+    #  unarchive:
+    #    src: "/tmp/goland-{{ goland_version }}.tar.gz"
+    #    dest: "/opt/"
+    #    remote_src: yes
+    #    extra_opts: ["--strip-components=1"]
+    #    mode: '0755'
 
-    - name: Clean up downloaded tarball
-      file:
-        path: "/tmp/goland-{{ goland_version }}.tar.gz"
-        state: absent
+    #- name: Clean up downloaded tarball
+    #  file:
+    #    path: "/tmp/goland-{{ goland_version }}.tar.gz"
+    #    state: absent

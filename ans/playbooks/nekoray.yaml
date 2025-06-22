@@ -7,7 +7,7 @@
       block:
         - name: Create AppImages directory
           ansible.builtin.file:
-            path: "/home/ext/AppImages"
+            path: "/home/ext/AppImages/nekoray"
             state: directory
             owner: ext
             group: ext
@@ -16,7 +16,7 @@
         - name: Download Nekoray AppImage
           ansible.builtin.get_url:
             url: "https://github.com/MatsuriDayo/nekoray/releases/download/4.0.1/nekoray-4.0.1-2024-12-12-linux-x64.AppImage"
-            dest: "/home/ext/AppImages/nekoray.AppImage"
+            dest: "/home/ext/AppImages/nekoray/nekoray.AppImage"
             owner: ext
             group: ext
             mode: '0755'
@@ -25,11 +25,11 @@
         - name: Extract icon from AppImage
           ansible.builtin.command:
             cmd: |
-              /home/ext/AppImages/nekoray.AppImage --appimage-extract nekobox.png
-              mv squashfs-root/nekobox.png /home/ext/.local/share/icons/hicolor/256x256/apps/nekoray.png
+              /home/ext/AppImages/nekoray/nekoray.AppImage --appimage-extract nekobox.png
+              mv squashfs-root/nekobox.png /home/ext/AppImages/nekoray/nekoray.png
               rm -rf squashfs-root
           args:
-            creates: "/home/ext/.local/share/icons/hicolor/256x256/apps/nekoray.png"
+            creates: "/home/ext/AppImages/nekoray/nekoray.png"
           become: no
           changed_when: false
 
@@ -41,15 +41,12 @@
               Name=Nekoray
               GenericName=Proxy Client
               Comment=Qt-based cross-platform proxy client
-              Exec=/home/ext/AppImages/nekoray.AppImage
-              Icon=nekoray
+              Exec=/home/ext/AppImages/nekoray/nekoray.AppImage
+              Icon=/home/ext/AppImages/nekoray/nekoray.png
               Terminal=false
               Categories=Network;
               StartupWMClass=nekoray
               X-AppImage-Version=4.0.1
-              Icon=/home/ext/.local/share/icons/hicolor/256x256/apps/nekoray.png
-              Icon[en_US]=/home/ext/.local/share/icons/hicolor/256x256/apps/nekoray.png
-              X-GNOME-FullNameIcon=/home/ext/.local/share/icons/hicolor/256x256/apps/nekoray.png
             dest: "/home/ext/.local/share/applications/nekoray.desktop"
             owner: ext
             group: ext

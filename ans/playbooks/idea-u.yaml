@@ -1,10 +1,10 @@
 ---
-- name: Install latest GoLand IDE for Linux
+- name: Install latest IDE for Linux
   hosts: all
   gather_facts: false
 
   tasks:
-    - name: Get latest GoLand release info
+    - name: Get latest release info
       uri:
         url: "https://data.services.jetbrains.com/products/releases?code=IIU&latest=true&type=release"
         return_content: yes
@@ -24,7 +24,7 @@
         ide_version: "{{ ide_linux_url.split('/')[-1].split('.tar.gz')[0].split('ideaIU-')[-1] }}"
       delegate_to: localhost
 
-    - name: Detected latest goland
+    - name: Detected latest ide
       debug:
         msg: |
           URL: {{ ide_linux_url }}

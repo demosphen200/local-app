@@ -48,27 +48,14 @@
       ansible.builtin.apt:
         name: helm
         update_cache: true
+      #curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
+      #sudo apt-get install apt-transport-https --yes
+      #echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+      #sudo apt-get update
+      #sudo apt-get install helm
 
-- name: Install Kubernetes Lens
-  block:
-    - name: Add Lens GPG key
-      apt_key:
-        url: "https://downloads.k8slens.dev/apt/gpg.key"
-        state: present
-
-    - name: Add Lens repository
-      apt_repository:
-        repo: "deb [arch=amd64] https://downloads.k8slens.dev/apt/deb stable main"
-        filename: lens
-        update_cache: yes
-
-    - name: Install Lens
-      apt:
-        name: lens
-        state: present
-
-- name: Show installation results
-  debug:
-    msg: |
-      kubectl: {{ kubectl_check.stdout | default('NOT INSTALLED') }}
-      Helm: {{ helm_check.stdout | default('NOT INSTALLED') }}
+- name: Install Kubernetes Lens IDE
+  ansible.builtin.shell: |
+    curl -fsSL https://downloads.k8slens.dev/keys/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/lens-archive-keyring.gpg > /dev/null
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/lens-archive-keyring.gpg] https://downloads.k8slens.dev/apt/debian stable main" | sudo tee /etc/apt/sources.list.d/lens.list > /dev/null
+    sudo apt update && sudo apt install lens

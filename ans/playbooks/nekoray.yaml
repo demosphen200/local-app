@@ -21,19 +21,40 @@
             group: ext
             mode: '0755'
 
-        - name: Create desktop entry
+
+        - name: Extract icon from AppImage
+          ansible.builtin.command:
+            cmd: |
+              /home/ext/AppImages/nekoray.AppImage --appimage-extract nekoray.png
+              mv squashfs-root/nekoray.png /home/ext/.local/share/icons/hicolor/256x256/apps/nekoray.png
+              rm -rf squashfs-root
+          args:
+            creates: "/home/ext/.local/share/icons/hicolor/256x256/apps/nekoray.png"
+          become: no
+          changed_when: false
+
+        - name: Create proper desktop entry
           ansible.builtin.copy:
             content: |
               [Desktop Entry]
-              Version=1.0
               Type=Application
               Name=Nekoray
+              GenericName=Proxy Client
               Comment=Qt-based cross-platform proxy client
               Exec=/home/ext/AppImages/nekoray.AppImage
               Icon=nekoray
               Terminal=false
               Categories=Network;
+              StartupWMClass=nekoray
+              X-AppImage-Version=4.0.1
             dest: "/home/ext/.local/share/applications/nekoray.desktop"
             owner: ext
             group: ext
             mode: '0644'
+        - name: Update desktop database
+          ansible.builtin.command: update-desktop-database /home/ext/.local/share/applications
+          become: no
+
+        - name: Update icon cache
+          ansible.builtin.command: gtk-update-icon-cache -f /home/ext/.local/share/icons/hicolor
+          become: no

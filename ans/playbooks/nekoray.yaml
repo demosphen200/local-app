@@ -54,6 +54,7 @@
             owner: ext
             group: ext
             mode: '0644'
+
         - name: Update desktop database
           ansible.builtin.command: update-desktop-database /home/ext/.local/share/applications
           become: no

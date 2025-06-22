@@ -21,12 +21,14 @@
 
     - name: Extract version from URL
       set_fact:
-        goland_version: "{{ goland_linux_url | regex_search('goland-(.*?).tar.gz') | first | replace('goland-', '') }}"
+        goland_version: "{{ goland_linux_url.split('/')[-1].split('.tar.gz')[0].split('goland-')[-1] }}"
       delegate_to: localhost
 
-    - name: Debug extracted version
+    - name: Detected latest goland
       debug:
-        msg: "Detected GoLand version: {{ goland_version }}\nURL: {{ goland_linux_url }}"
+        msg: |
+          URL: {{ goland_linux_url }}
+          GoLand version: {{ goland_version }}
 
     - name: Download GoLand
       get_url:
@@ -35,28 +37,22 @@
         mode: '0755'
         timeout: 60
 
-    #- name: Clean previous installation
-    #  file:
-    #    path: "/opt/GoLand-{{ goland_version }}"
-    #    state: absent
-    #  become: true
+    - name: Clean previous installation
+      file:
+        path: "/opt/GoLand-{{ goland_version }}"
+        state: absent
+      become: true
 
-    #- name: Install GoLand
-    #  become: true
-    #  unarchive:
-    #    src: "/tmp/goland-{{ goland_version }}.tar.gz"
-    #    dest: "/opt/"
-    #    remote_src: yes
-    #    extra_opts: ["--strip-components=1"]
-    #    mode: '0755'
+    - name: Install GoLand
+      become: true
+      unarchive:
+        src: "/tmp/goland-{{ goland_version }}.tar.gz"
+        dest: "/opt/"
+        remote_src: yes
+        extra_opts: ["--strip-components=1"]
+        mode: '0755'
 
-    #- name: Cleanup download
-    #  file:
-    #    path: "/tmp/goland-{{ goland_version }}.tar.gz"
-    #    state: absent
-
-    #- name: Verify installation
-    #  stat:
-    #    path: "/opt/GoLand-{{ goland_version }}/bin/goland.sh"
-    #  register: install_check
-    #  become: true
+    - name: Cleanup download
+      file:
+        path: "/tmp/goland-{{ goland_version }}.tar.gz"
+        state: absent

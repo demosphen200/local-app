@@ -22,11 +22,6 @@
         dest: "/usr/local/bin/kubectl"
         mode: "0755"
 
-    - name: Verify kubectl installation
-      command: kubectl version --client --short
-      register: kubectl_check
-      changed_when: false
-
 - name: Install Helm 3 (correct way)
   block:
     - name: Download Helm installer script

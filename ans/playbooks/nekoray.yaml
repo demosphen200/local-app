@@ -50,11 +50,3 @@
             owner: ext
             group: ext
             mode: '0644'
-
-        - name: Update desktop database
-          ansible.builtin.command: update-desktop-database /home/ext/.local/share/applications
-          become: no
-
-        - name: Update icon cache
-          ansible.builtin.command: gtk-update-icon-cache -f /home/ext/.local/share/icons/hicolor
-          become: no

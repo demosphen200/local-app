@@ -22,23 +22,32 @@
         dest: "/usr/local/bin/kubectl"
         mode: "0755"
 
-- name: Install Helm 3 (correct way)
+- name: Install Helm from official Debian repository
   block:
-    - name: Download Helm installer script
-      get_url:
-        url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-        dest: /tmp/get_helm.sh
-        mode: '0755'
+    - name: Ensure prerequisites are installed
+      ansible.builtin.apt:
+        name: apt-transport-https
+        state: present
+        update_cache: yes
 
-    - name: Run Helm installer
-      command: /tmp/get_helm.sh
-      args:
-        removes: /usr/local/bin/helm  # делает идемпотентным
+    - name: Import Helm GPG key
+      ansible.builtin.apt_key:
+        url: https://baltocdn.com/helm/signing.asc
+        keyring: /usr/share/keyrings/helm.gpg
+        state: present
 
-    - name: Verify Helm installation
-      command: helm version
-      register: helm_check
-      changed_when: false
+    - name: Configure Helm repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch={{ ansible_architecture }} signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main"
+        filename: helm-stable
+        update_cache: yes
+        state: present
+
+    - name: Install Helm package
+      ansible.builtin.apt:
+        name: helm
+        state: latest
+        update_cache: no
 
 - name: Install Kubernetes Lens
   block:

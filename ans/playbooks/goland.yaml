@@ -31,6 +31,7 @@
         state: absent
 
     - name: Extract GoLand to /opt
+      become: true
       unarchive:
         src: "/tmp/goland-{{ goland_version }}.tar.gz"
         dest: "/opt/"

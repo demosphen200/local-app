@@ -1,0 +1,28 @@
+GO - GoLand
+IIU - IntelliJ IDEA Ultimate
+IIC - IntelliJ IDEA Community
+PS - PhpStorm
+WS - WebStorm
+RM - RubyMine
+PY - PyCharm Professional
+PCC - PyCharm Community
+CL - CLion
+RD - Rider
+DG - Datalore
+DS - DataSpell
+AC - AppCode
+RR - ReSharper
+RSU - ReSharper C++
+TBA - TeamCity
+YTD - YouTrack
+UPS - Upsource
+HG - Hub
+
+Дополнительные продукты:
+MPS - MPS (Meta Programming System)
+FLE - Fleet (новая IDE)
+DAT - DataGrip
+RDCPPP - Rider for Unreal Engine
+DCDR - DotCover
+DOT - dotTrace
+DMA - dotMemory

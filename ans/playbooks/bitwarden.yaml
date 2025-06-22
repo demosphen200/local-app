@@ -1,0 +1,11 @@
+---
+- name: Install latest IDE for Linux
+  hosts: all
+  gather_facts: false
+
+  tasks:
+    - name: Install Bitwarden
+      ansible.builtin.shell: |
+        wget -O- https://packages.bitwarden.com/deb/bitwarden.gpg | gpg --dearmor | sudo tee /usr/share/keyrings/bitwarden.gpg > /dev/null
+        echo "deb [signed-by=/usr/share/keyrings/bitwarden.gpg] https://packages.bitwarden.com/deb/ any main" | sudo tee /etc/apt/sources.list.d/bitwarden.list
+        sudo apt update && sudo apt install -y bitwarden

@@ -47,7 +47,7 @@
       ansible.builtin.apt:
         name: helm
         state: latest
-        update_cache: no
+        update_cache: true
 
 - name: Install Kubernetes Lens
   block:

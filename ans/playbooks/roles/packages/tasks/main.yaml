@@ -20,5 +20,8 @@
       - htop
       - net-tools
       - konsole
+      - iftop
+      - iptraf-ng
+      - nload
     state: present
     update_cache: no

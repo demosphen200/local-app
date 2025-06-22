@@ -6,6 +6,6 @@
   tasks:
     - name: Install Bitwarden
       ansible.builtin.shell: |
-        wget -O- https://packages.bitwarden.com/deb/bitwarden.gpg | gpg --dearmor | sudo tee /usr/share/keyrings/bitwarden.gpg > /dev/null
-        echo "deb [signed-by=/usr/share/keyrings/bitwarden.gpg] https://packages.bitwarden.com/deb/ any main" | sudo tee /etc/apt/sources.list.d/bitwarden.list
-        sudo apt update && sudo apt install -y bitwarden
+        wget -qO- https://downloads.bitwarden.com/linux/debian/bitwarden-release-key.gpg | gpg --dearmor | sudo tee /usr/share/keyrings/bitwarden-archive-keyring.gpg > /dev/null
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/bitwarden-archive-keyring.gpg] https://downloads.bitwarden.com/linux/debian stable main" | sudo tee /etc/apt/sources.list.d/bitwarden.list
+        sudo apt-get update && sudo apt-get install -y bitwarden

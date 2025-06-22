@@ -28,9 +28,9 @@
     state: started
     enabled: yes
 
-- name: Add current user to docker group
+- name: Add ext to docker group
   user:
-    name: "{{ ansible_user_id }}"
+    name: "ext"
     groups: docker
     append: yes
 

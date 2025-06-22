@@ -14,7 +14,7 @@
 
     - name: Debug raw version info
       debug:
-      msg: "Raw version info: {{ goland_release.content }}"
+        msg: "Raw version info: {{ goland_release.content }}"
 
 
     - name: Extract latest version
@@ -25,11 +25,11 @@
 
     - name: Debug version details
       debug:
-      msg: |
-        Detected GoLand version: {{ goland_version }}
-        Build number: {{ goland_build }}
-        Release date: {{ goland_release_date }}
-        Download URL: {{ (goland_release.content | from_json).GO[0].downloads.linux.link }}
+        msg: |
+          Detected GoLand version: {{ goland_version }}
+          Build number: {{ goland_build }}
+          Release date: {{ goland_release_date }}
+          Download URL: {{ (goland_release.content | from_json).GO[0].downloads.linux.link }}
 
     - name: Download GoLand tarball
       get_url:

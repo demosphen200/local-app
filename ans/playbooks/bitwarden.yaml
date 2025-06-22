@@ -4,8 +4,21 @@
   gather_facts: false
 
   tasks:
-    - name: Install Bitwarden
-      ansible.builtin.shell: |
-        wget -qO- https://downloads.bitwarden.com/linux/debian/bitwarden-release-key.gpg | gpg --dearmor | sudo tee /usr/share/keyrings/bitwarden-archive-keyring.gpg > /dev/null
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/bitwarden-archive-keyring.gpg] https://downloads.bitwarden.com/linux/debian stable main" | sudo tee /etc/apt/sources.list.d/bitwarden.list
-        sudo apt-get update && sudo apt-get install -y bitwarden
+    - name: Download Bitwarden .deb package
+      ansible.builtin.get_url:
+        url: "https://vault.bitwarden.com/download/?app=desktop&platform=linux&variant=deb"
+        dest: /tmp/bitwarden.deb
+        mode: '0644'
+      become: yes
+
+    - name: Install Bitwarden Desktop
+      apt:
+        deb: /tmp/bitwarden.deb
+        state: present
+      become: yes
+
+    - name: Clean up downloaded .deb
+      file:
+        path: /tmp/bitwarden.deb
+        state: absent
+      become: yes

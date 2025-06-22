@@ -21,7 +21,6 @@
       set_fact:
         goland_version: "{{ (goland_release.content | from_json).GO[0].version }}"
       delegate_to: localhost
-      run_once: true
 
     - name: Debug version details
       debug:

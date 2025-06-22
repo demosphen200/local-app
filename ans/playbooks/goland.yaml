@@ -1,9 +1,10 @@
 ---
-- name: Install latest GoLand IDE (minimal)
+- name: Install latest GoLand IDE for Linux
   hosts: all
+  gather_facts: false
 
   tasks:
-    - name: Get latest GoLand version info
+    - name: Get latest GoLand release info
       uri:
         url: "https://data.services.jetbrains.com/products/releases?code=GO&latest=true&type=release"
         return_content: yes
@@ -12,37 +13,35 @@
       delegate_to: localhost
       run_once: true
 
-    - name: Debug raw version info
-      debug:
-        msg: "Raw version info: {{ goland_release.content }}"
-
-
-    - name: Extract latest version
+    - name: Extract Linux download URL
       set_fact:
-        goland_version: "{{ (goland_release.content | from_json).GO[0].version }}"
+        goland_linux_url: "{{ (goland_release.content | from_json).GO[0].downloads.linux.link }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Extract version from URL
+      set_fact:
+        goland_version: "{{ goland_linux_url | regex_search('goland-(.*?).tar.gz') | first | replace('goland-', '') }}"
       delegate_to: localhost
 
-    - name: Debug version details
+    - name: Debug extracted version
       debug:
-        msg: |
-          Detected GoLand version: {{ goland_version }}
-          Build number: {{ goland_build }}
-          Release date: {{ goland_release_date }}
-          Download URL: {{ (goland_release.content | from_json).GO[0].downloads.linux.link }}
+        msg: "Detected GoLand version: {{ goland_version }}\nURL: {{ goland_linux_url }}"
 
-    - name: Download GoLand tarball
+    - name: Download GoLand
       get_url:
-        url: "{{ (goland_release.content | from_json).GO[0].downloads.linux.link }}"
+        url: "{{ goland_linux_url }}"
         dest: "/tmp/goland-{{ goland_version }}.tar.gz"
         mode: '0755'
         timeout: 60
 
-    #- name: Remove previous installation if exists
+    #- name: Clean previous installation
     #  file:
     #    path: "/opt/GoLand-{{ goland_version }}"
     #    state: absent
+    #  become: true
 
-    #- name: Extract GoLand to /opt
+    #- name: Install GoLand
     #  become: true
     #  unarchive:
     #    src: "/tmp/goland-{{ goland_version }}.tar.gz"
@@ -51,7 +50,13 @@
     #    extra_opts: ["--strip-components=1"]
     #    mode: '0755'
 
-    #- name: Clean up downloaded tarball
+    #- name: Cleanup download
     #  file:
     #    path: "/tmp/goland-{{ goland_version }}.tar.gz"
     #    state: absent
+
+    #- name: Verify installation
+    #  stat:
+    #    path: "/opt/GoLand-{{ goland_version }}/bin/goland.sh"
+    #  register: install_check
+    #  become: true

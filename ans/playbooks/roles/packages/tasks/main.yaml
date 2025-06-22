@@ -23,5 +23,7 @@
       - iftop
       - iptraf-ng
       - nload
+      - doublecmd-gtk
+      - gparted
     state: present
     update_cache: no

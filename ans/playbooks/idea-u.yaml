@@ -1,0 +1,51 @@
+---
+- name: Install latest GoLand IDE for Linux
+  hosts: all
+  gather_facts: false
+
+  tasks:
+    - name: Get latest GoLand release info
+      uri:
+        url: "https://data.services.jetbrains.com/products/releases?code=IIU&latest=true&type=release"
+        return_content: yes
+      register: ide_release
+      changed_when: false
+      delegate_to: localhost
+      run_once: true
+
+    - name: Extract Linux download URL
+      set_fact:
+        ide_linux_url: "{{ (ide_release.content | from_json).IIU[0].downloads.linux.link }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Extract version from URL
+      set_fact:
+        ide_version: "{{ ide_linux_url.split('/')[-1].split('.tar.gz')[0].split('ideaIU-')[-1] }}"
+      delegate_to: localhost
+
+    - name: Detected latest goland
+      debug:
+        msg: |
+          URL: {{ ide_linux_url }}
+          IDE version: {{ ide_version }}
+
+    - name: Download IDE
+      get_url:
+        url: "{{ ide_linux_url }}"
+        dest: "/tmp/iiu-{{ ide_version }}.tar.gz"
+        mode: '0755'
+        timeout: 60
+
+    - name: Install IDE
+      become: true
+      unarchive:
+        src: "/tmp/iiu-{{ ide_version }}.tar.gz"
+        dest: "/opt/"
+        remote_src: yes
+        mode: '0755'
+
+    - name: Cleanup download
+      file:
+        path: "/tmp/iiu-{{ ide_version }}.tar.gz"
+        state: absent

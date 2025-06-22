@@ -1,0 +1,45 @@
+---
+- name: Install required packages
+  apt:
+    name: "{{ item }}"
+    state: present
+    update_cache: yes
+  loop: "{{ docker_required_packages }}"
+
+- name: Add Docker GPG key
+  apt_key:
+    url: "{{ docker_gpg_key }}"
+    state: present
+
+- name: Add Docker repository
+  apt_repository:
+    repo: "{{ docker_repository }}"
+    state: present
+    update_cache: yes
+
+- name: Install Docker
+  package:
+    name: "{{ docker_packages }}"
+    state: present
+
+- name: Ensure Docker is running and enabled
+  service:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Add current user to docker group
+  user:
+    name: "{{ ansible_user }}"
+    groups: docker
+    append: yes
+
+- name: Reboot host to apply group changes (if needed)
+  reboot:
+    msg: "Reboot initiated by Ansible to apply docker group changes"
+    connect_timeout: 5
+    reboot_timeout: 600
+    pre_reboot_delay: 0
+    post_reboot_delay: 30
+  when: docker_reboot_required
+

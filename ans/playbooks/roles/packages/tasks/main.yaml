@@ -1,0 +1,23 @@
+---
+- name: Обновление кэша apt
+  become: yes
+  ansible.builtin.apt:
+    update_cache: yes
+    #cache_valid_time: 86400
+  #tags: [tools, apt]
+
+- name: Установка пакетов
+  become: yes
+  ansible.builtin.apt:
+    name:
+      - mc
+      - nano
+      - curl
+      - wget
+      - gnupg
+      - jq
+      - yq
+      - htop
+      - net-tools
+    state: present
+    update_cache: no

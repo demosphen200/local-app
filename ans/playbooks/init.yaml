@@ -1,0 +1,10 @@
+- name: Разрешения для ext
+  hosts: all
+  gather_facts: true
+
+  tasks:
+    - name: Разрешить ext sudo без пароля
+      ansible.builtin.lineinfile:
+        path: /etc/sudoers
+        line: "{{ ext_user }} ALL=(ALL) NOPASSWD:ALL"
+        validate: "visudo -cf %s"

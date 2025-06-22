@@ -1,0 +1,64 @@
+---
+- name: Install required dependencies
+  apt:
+    name:
+      - curl
+      - gpg
+      - apt-transport-https
+    state: present
+    update_cache: yes
+
+- name: Install kubectl
+  block:
+    - name: Download kubectl binary
+      get_url:
+        url: "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
+        dest: "/usr/local/bin/kubectl"
+        mode: "0755"
+
+    - name: Verify kubectl installation
+      command: kubectl version --client --short
+      register: kubectl_check
+      changed_when: false
+
+- name: Install Helm 3 (correct way)
+  block:
+    - name: Download Helm installer script
+      get_url:
+        url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        dest: /tmp/get_helm.sh
+        mode: '0755'
+
+    - name: Run Helm installer
+      command: /tmp/get_helm.sh
+      args:
+        removes: /usr/local/bin/helm  # делает идемпотентным
+
+    - name: Verify Helm installation
+      command: helm version
+      register: helm_check
+      changed_when: false
+
+- name: Install Kubernetes Lens
+  block:
+    - name: Add Lens GPG key
+      apt_key:
+        url: "https://downloads.k8slens.dev/apt/gpg.key"
+        state: present
+
+    - name: Add Lens repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://downloads.k8slens.dev/apt/deb stable main"
+        filename: lens
+        update_cache: yes
+
+    - name: Install Lens
+      apt:
+        name: lens
+        state: present
+
+- name: Show installation results
+  debug:
+    msg: |
+      kubectl: {{ kubectl_check.stdout | default('NOT INSTALLED') }}
+      Helm: {{ helm_check.stdout | default('NOT INSTALLED') }}

@@ -19,5 +19,6 @@
       - yq
       - htop
       - net-tools
+      - konsole
     state: present
     update_cache: no

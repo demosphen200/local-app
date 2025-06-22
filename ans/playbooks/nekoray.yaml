@@ -47,6 +47,8 @@
               Categories=Network;
               StartupWMClass=nekoray
               X-AppImage-Version=4.0.1
+              Icon[en_US]=/home/ext/.local/share/icons/hicolor/256x256/apps/nekoray.png
+              X-GNOME-FullNameIcon=/home/ext/.local/share/icons/hicolor/256x256/apps/nekoray.png
             dest: "/home/ext/.local/share/applications/nekoray.desktop"
             owner: ext
             group: ext

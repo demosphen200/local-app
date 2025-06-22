@@ -23,11 +23,10 @@
 
 
         - name: Extract icon from AppImage
-          ansible.builtin.command:
-            cmd: |
-              /home/ext/AppImages/nekoray/nekoray.AppImage --appimage-extract "nekobox.png"
-              mv squashfs-root/nekobox.png /home/ext/AppImages/nekoray/nekoray.png
-              rm -rf squashfs-root
+          ansible.builtin.shell: |
+            /home/ext/AppImages/nekoray/nekoray.AppImage --appimage-extract "nekobox.png"
+            mv squashfs-root/nekobox.png /home/ext/AppImages/nekoray/nekoray.png
+            rm -rf squashfs-root
           args:
             creates: "/home/ext/AppImages/nekoray/nekoray.png"
           become: no

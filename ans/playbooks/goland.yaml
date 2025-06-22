@@ -1,0 +1,44 @@
+---
+- name: Install latest GoLand IDE (minimal)
+  hosts: all
+
+  tasks:
+    - name: Get latest GoLand version info
+      uri:
+        url: "https://data.services.jetbrains.com/products/releases?code=GO&latest=true&type=release"
+        return_content: yes
+      register: goland_release
+      changed_when: false
+      delegate_to: localhost
+      run_once: true
+
+    - name: Extract latest version
+      set_fact:
+        goland_version: "{{ (goland_release.content | from_json).GO[0].version }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Download GoLand tarball
+      get_url:
+        url: "{{ (goland_release.content | from_json).GO[0].downloads.linux.link }}"
+        dest: "/tmp/goland-{{ goland_version }}.tar.gz"
+        mode: '0755'
+        timeout: 60
+
+    - name: Remove previous installation if exists
+      file:
+        path: "/opt/GoLand-{{ goland_version }}"
+        state: absent
+
+    - name: Extract GoLand to /opt
+      unarchive:
+        src: "/tmp/goland-{{ goland_version }}.tar.gz"
+        dest: "/opt/"
+        remote_src: yes
+        extra_opts: ["--strip-components=1"]
+        mode: '0755'
+
+    - name: Clean up downloaded tarball
+      file:
+        path: "/tmp/goland-{{ goland_version }}.tar.gz"
+        state: absent

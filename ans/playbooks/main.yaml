@@ -7,4 +7,5 @@
     - packages
     - docker
     - chrome
+    - k8
   tasks:

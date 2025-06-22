@@ -1,0 +1,39 @@
+---
+- name: Install latest GoLand IDE for Linux
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Install Nekoray 4.0.1 AppImage
+      block:
+        - name: Create AppImages directory
+          ansible.builtin.file:
+            path: "/home/ext/AppImages"
+            state: directory
+            owner: ext
+            group: ext
+            mode: '0755'
+
+        - name: Download Nekoray AppImage
+          ansible.builtin.get_url:
+            url: "https://github.com/MatsuriDayo/nekoray/releases/download/4.0.1/nekoray-4.0.1-2024-12-12-linux-x64.AppImage"
+            dest: "/home/ext/AppImages/nekoray.AppImage"
+            owner: ext
+            group: ext
+            mode: '0755'
+
+        - name: Create desktop entry
+          ansible.builtin.copy:
+            content: |
+              [Desktop Entry]
+              Version=1.0
+              Type=Application
+              Name=Nekoray
+              Comment=Qt-based cross-platform proxy client
+              Exec=/home/ext/AppImages/nekoray.AppImage
+              Icon=nekoray
+              Terminal=false
+              Categories=Network;
+            dest: "/home/ext/.local/share/applications/nekoray.desktop"
+            owner: ext
+            group: ext
+            mode: '0644'

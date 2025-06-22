@@ -1,26 +1,36 @@
 ---
-- name: Install required packages
-  apt:
-    name: "{{ item }}"
+- name: Установка пакетов
+  become: yes
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - software-properties-common
+      - gnupg-agent
     state: present
-    update_cache: yes
-  loop: "{{ docker_required_packages }}"
+    update_cache: no
 
 - name: Add Docker GPG key
   apt_key:
-    url: "{{ docker_gpg_key }}"
+    url: "https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg"
     state: present
 
 - name: Add Docker repository
   apt_repository:
-    repo: "{{ docker_repository }}"
+    repo: "deb [arch=amd64] https://download.docker.com/linux/{{ ansible_distribution | lower }} {{ ansible_distribution_release }} stable"
     state: present
     update_cache: yes
 
-- name: Install Docker
-  package:
-    name: "{{ docker_packages }}"
+- name: Установка пакетов
+  become: yes
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
     state: present
+    update_cache: no
 
 - name: Ensure Docker is running and enabled
   service:
@@ -34,12 +44,12 @@
     groups: docker
     append: yes
 
-- name: Reboot host to apply group changes (if needed)
-  reboot:
-    msg: "Reboot initiated by Ansible to apply docker group changes"
-    connect_timeout: 5
-    reboot_timeout: 600
-    pre_reboot_delay: 0
-    post_reboot_delay: 30
-  when: docker_reboot_required
+#- name: Reboot host to apply group changes (if needed)
+#  reboot:
+#    msg: "Reboot initiated by Ansible to apply docker group changes"
+#    connect_timeout: 5
+#    reboot_timeout: 600
+#    pre_reboot_delay: 0
+#    post_reboot_delay: 30
+#  when: docker_reboot_required
 

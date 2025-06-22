@@ -1,3 +1,0 @@
----
-_docker_repo_distribution: "{{ ansible_distribution | lower }}"
-_docker_repo_codename: "{{ ansible_distribution_release }}"

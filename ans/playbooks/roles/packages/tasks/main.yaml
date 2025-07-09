@@ -25,5 +25,7 @@
       - nload
       - doublecmd-gtk
       - gparted
+      - wireguard
+      - wireguard-tools
     state: present
     update_cache: no

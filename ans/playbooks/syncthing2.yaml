@@ -1,0 +1,90 @@
+---
+- name: Install and configure Syncthing
+  hosts: all
+  become: true
+
+  vars_prompt:
+    - name: syncthing_user
+      prompt: "Enter username to run Syncthing as"
+      private: false
+
+    - name: syncthing_listen_address
+      prompt: |-
+        Select GUI listen address:
+          1) 127.0.0.1 - localhost only
+          2) 0.0.0.0   - all interfaces (network access)
+        Enter 1 or 2
+      private: false
+
+  pre_tasks:
+    - name: Get user info
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ syncthing_user }}"
+
+    - name: Set user home directory
+      ansible.builtin.set_fact:
+        syncthing_home: "{{ getent_passwd[syncthing_user][4] }}"
+
+    - name: Set listen address
+      ansible.builtin.set_fact:
+        syncthing_gui_address: "{{ '127.0.0.1:8384' if syncthing_listen_address == '1' else '0.0.0.0:8384' }}"
+
+    - name: Show settings
+      ansible.builtin.debug:
+        msg: "User: {{ syncthing_user }}, GUI: {{ syncthing_gui_address }}"
+
+  tasks:
+    - name: Install dependencies
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+        state: present
+        update_cache: true
+
+    - name: Add Syncthing GPG key
+      ansible.builtin.get_url:
+        url: https://syncthing.net/release-key.gpg
+        dest: /usr/share/keyrings/syncthing-archive-keyring.gpg
+        mode: "0644"
+
+    - name: Add Syncthing repository
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [signed-by=/usr/share/keyrings/syncthing-archive-keyring.gpg]
+          https://apt.syncthing.net/ syncthing stable
+        filename: syncthing
+        state: present
+
+    - name: Install Syncthing
+      ansible.builtin.apt:
+        name: syncthing
+        state: present
+        update_cache: true
+
+    - name: Enable and start Syncthing service
+      ansible.builtin.systemd:
+        name: "syncthing@{{ syncthing_user }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Wait for Syncthing to generate config
+      ansible.builtin.wait_for:
+        path: "{{ syncthing_home }}/.local/state/syncthing/config.xml"
+        timeout: 30
+
+    - name: Allow GUI access from network
+      ansible.builtin.lineinfile:
+        path: "{{ syncthing_home }}/.local/state/syncthing/config.xml"
+        regexp: '<address>127\.0\.0\.1:8384</address>'
+        line: "        <address>{{ syncthing_gui_address }}</address>"
+      notify: Restart Syncthing
+
+  handlers:
+    - name: Restart Syncthing
+      ansible.builtin.systemd:
+        name: "syncthing@{{ syncthing_user }}"
+        state: restarted

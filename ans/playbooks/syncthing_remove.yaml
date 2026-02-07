@@ -1,0 +1,51 @@
+---
+- name: Remove Syncthing
+  hosts: all
+  become: true
+
+  vars_prompt:
+    - name: syncthing_user
+      prompt: "Enter username Syncthing is running as"
+      private: false
+
+  pre_tasks:
+    - name: Get user info
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ syncthing_user }}"
+
+    - name: Set user home directory
+      ansible.builtin.set_fact:
+        syncthing_home: "{{ getent_passwd[syncthing_user][4] }}"
+
+  tasks:
+    - name: Stop and disable Syncthing service
+      ansible.builtin.systemd:
+        name: "syncthing@{{ syncthing_user }}"
+        state: stopped
+        enabled: false
+      ignore_errors: true
+
+    - name: Remove Syncthing package
+      ansible.builtin.apt:
+        name: syncthing
+        state: absent
+        purge: true
+
+    - name: Remove Syncthing repository
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [signed-by=/usr/share/keyrings/syncthing-archive-keyring.gpg]
+          https://apt.syncthing.net/ syncthing stable
+        filename: syncthing
+        state: absent
+
+    - name: Remove Syncthing GPG key
+      ansible.builtin.file:
+        path: /usr/share/keyrings/syncthing-archive-keyring.gpg
+        state: absent
+
+    - name: Remove Syncthing config directory
+      ansible.builtin.file:
+        path: "{{ syncthing_home }}/.local/state/syncthing"
+        state: absent

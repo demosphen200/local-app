@@ -26,13 +26,13 @@
   block:
     - name: Download Helm GPG key
       ansible.builtin.shell: |
-        curl -fsSL https://baltocdn.com/helm/signing.asc | gpg --dearmor -o /etc/apt/keyrings/helm.gpg
+        curl -fsSL https://packages.buildkite.com/helm-linux/helm-debian/gpgkey | gpg --dearmor -o /etc/apt/keyrings/helm.gpg
       args:
         creates: /etc/apt/keyrings/helm.gpg
 
     - name: Add Helm repository
       ansible.builtin.apt_repository:
-        repo: "deb [arch={{ ansible_architecture }} signed-by=/etc/apt/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main"
+        repo: "deb [signed-by=/etc/apt/keyrings/helm.gpg] https://packages.buildkite.com/helm-linux/helm-debian/any/ any main"
         filename: helm-stable
         state: present
         update_cache: yes

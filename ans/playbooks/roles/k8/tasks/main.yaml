@@ -22,42 +22,42 @@
         dest: "/usr/local/bin/kubectl"
         mode: "0755"
 
-- name: Install Helm
-  block:
-    - name: Download Helm GPG key
-      ansible.builtin.shell: |
-        curl -fsSL https://packages.buildkite.com/helm-linux/helm-debian/gpgkey | gpg --dearmor -o /usr/share/keyrings/helm.gpg
-      args:
-        creates: /usr/share/keyrings/helm.gpg
-
-    - name: Add Helm repository
-      ansible.builtin.apt_repository:
-        repo: "deb [signed-by=/usr/share/keyrings/helm.gpg] https://packages.buildkite.com/helm-linux/helm-debian/any/ any main"
-        filename: helm-stable-debian
-        state: present
-        update_cache: yes
-
-    - name: Install Helm package
-      ansible.builtin.apt:
-        name: helm
-        state: present
-
-- name: Install Kubernetes Lens IDE
-  block:
-    - name: Download Lens GPG key
-      ansible.builtin.shell: |
-        curl -fsSL https://downloads.k8slens.dev/keys/gpg | gpg --dearmor -o /etc/apt/keyrings/lens-archive-keyring.gpg
-      args:
-        creates: /etc/apt/keyrings/lens-archive-keyring.gpg
-
-    - name: Add Lens repository
-      ansible.builtin.apt_repository:
-        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/lens-archive-keyring.gpg] https://downloads.k8slens.dev/apt/debian stable main"
-        filename: lens
-        state: present
-        update_cache: yes
-
-    - name: Install Lens package
-      ansible.builtin.apt:
-        name: lens
-        state: present
+#- name: Install Helm
+#  block:
+#    - name: Download Helm GPG key
+#      ansible.builtin.shell: |
+#        curl -fsSL https://packages.buildkite.com/helm-linux/helm-debian/gpgkey | gpg --dearmor -o /usr/share/keyrings/helm.gpg
+#      args:
+#        creates: /usr/share/keyrings/helm.gpg
+#
+#    - name: Add Helm repository
+#      ansible.builtin.apt_repository:
+#        repo: "deb [signed-by=/usr/share/keyrings/helm.gpg] https://packages.buildkite.com/helm-linux/helm-debian/any/ any main"
+#        filename: helm-stable-debian
+#        state: present
+#        update_cache: yes
+#
+#    - name: Install Helm package
+#      ansible.builtin.apt:
+#        name: helm
+#        state: present
+#
+#- name: Install Kubernetes Lens IDE
+#  block:
+#    - name: Download Lens GPG key
+#      ansible.builtin.shell: |
+#        curl -fsSL https://downloads.k8slens.dev/keys/gpg | gpg --dearmor -o /etc/apt/keyrings/lens-archive-keyring.gpg
+#      args:
+#        creates: /etc/apt/keyrings/lens-archive-keyring.gpg
+#
+#    - name: Add Lens repository
+#      ansible.builtin.apt_repository:
+#        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/lens-archive-keyring.gpg] https://downloads.k8slens.dev/apt/debian stable main"
+#        filename: lens
+#        state: present
+#        update_cache: yes
+#
+#    - name: Install Lens package
+#      ansible.builtin.apt:
+#        name: lens
+#        state: present

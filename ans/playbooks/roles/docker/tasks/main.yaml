@@ -6,7 +6,7 @@
       - apt-transport-https
       - ca-certificates
       - curl
-      - software-properties-common
+      #- software-properties-common
       - gnupg-agent
     state: present
     update_cache: no

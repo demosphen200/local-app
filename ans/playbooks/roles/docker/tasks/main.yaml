@@ -15,9 +15,9 @@
 - name: Создание директории для ключей
   become: yes
   ansible.builtin.file:
-  path: /etc/apt/keyrings
-  state: directory
-  mode: "0755"
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
 
 - name: Добавление GPG-ключа Docker
   become: yes

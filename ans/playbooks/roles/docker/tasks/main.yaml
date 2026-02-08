@@ -3,26 +3,44 @@
   become: yes
   ansible.builtin.apt:
     name:
-      - apt-transport-https
+      #- apt-transport-https
       - ca-certificates
       - curl
       #- software-properties-common
-      - gnupg-agent
+      #- gnupg-agent
+      - gnupg
     state: present
     update_cache: no
 
-- name: Add Docker GPG key
-  apt_key:
-    url: "https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg"
-    state: present
+- name: Создание директории для ключей
+  become: yes
+  ansible.builtin.file:
+  path: /etc/apt/keyrings
+  state: directory
+  mode: "0755"
 
-- name: Add Docker repository
-  apt_repository:
-    repo: "deb [arch=amd64] https://download.docker.com/linux/{{ ansible_distribution | lower }} {{ ansible_distribution_release }} stable"
-    state: present
-    update_cache: yes
+- name: Добавление GPG-ключа Docker
+  become: yes
+  ansible.builtin.shell: >
+    curl -fsSL "https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg"
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  args:
+    creates: /etc/apt/keyrings/docker.gpg
 
-- name: Установка пакетов
+- name: Установка прав на GPG-ключ
+  become: yes
+  ansible.builtin.file:
+    path: /etc/apt/keyrings/docker.gpg
+    mode: "0644"
+
+- name: Добавление репозитория Docker
+  become: yes
+  ansible.builtin.apt_repository:
+  repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/{{ ansible_distribution | lower }} {{ ansible_distribution_release }} stable"
+  state: present
+  update_cache: yes
+
+- name: Установка Docker
   become: yes
   ansible.builtin.apt:
     name:
@@ -32,24 +50,16 @@
     state: present
     update_cache: no
 
-- name: Ensure Docker is running and enabled
-  service:
+- name: Запуск и включение Docker
+  become: yes
+  ansible.builtin.service:
     name: docker
     state: started
     enabled: yes
 
-- name: Add ext to docker group
-  user:
+- name: Добавление ext в группу docker
+  become: yes
+  ansible.builtin.user:
     name: "ext"
     groups: docker
     append: yes
-
-#- name: Reboot host to apply group changes (if needed)
-#  reboot:
-#    msg: "Reboot initiated by Ansible to apply docker group changes"
-#    connect_timeout: 5
-#    reboot_timeout: 600
-#    pre_reboot_delay: 0
-#    post_reboot_delay: 30
-#  when: docker_reboot_required
-

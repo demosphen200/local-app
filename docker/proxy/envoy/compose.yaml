@@ -1,0 +1,13 @@
+services:
+  envoy:
+    image: envoyproxy/envoy:v1.30-latest
+    env_file:
+      - .env
+    volumes:
+      - ./envoy.yaml:/etc/envoy/envoy.yaml.tmpl:ro
+      - ./entrypoint.sh:/docker-entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/docker-entrypoint.sh"]
+    command: ["envoy", "-c", "/etc/envoy/envoy.yaml"]
+    ports:
+      - "3128:3128"
+      - "9901:9901"

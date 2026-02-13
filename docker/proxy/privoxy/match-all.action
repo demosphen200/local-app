@@ -1,0 +1,2 @@
+{+add-header{Proxy-Authorization: Basic {{UPSTREAM_AUTH_BASE64}}}}
+/

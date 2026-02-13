@@ -1,0 +1,62 @@
+static_resources:
+  listeners:
+  - name: listener_0
+    address:
+      socket_address:
+        protocol: TCP
+        address: 0.0.0.0
+        port_value: 3128
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          access_log:
+          - name: envoy.access_loggers.stdout
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: local_service
+              domains: ["*"]
+              routes:
+              - match:
+                  connect_matcher: {}
+                route:
+                  cluster: upstream_proxy
+                  upgrade_configs:
+                  - upgrade_type: CONNECT
+                request_headers_to_add:
+                - header:
+                    key: "Proxy-Authorization"
+                    value: "Basic {{UPSTREAM_AUTH_BASE64}}"
+                  append: false
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: upstream_proxy
+                request_headers_to_add:
+                - header:
+                    key: "Proxy-Authorization"
+                    value: "Basic {{UPSTREAM_AUTH_BASE64}}"
+                  append: false
+
+  clusters:
+  - name: upstream_proxy
+    type: LOGICAL_DNS
+    # Connect to the upstream proxy
+    load_assignment:
+      cluster_name: upstream_proxy
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: {{UPSTREAM_HOST}}
+                port_value: {{UPSTREAM_PORT}}

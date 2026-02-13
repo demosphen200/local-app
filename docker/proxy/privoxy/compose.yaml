@@ -1,0 +1,8 @@
+services:
+  privoxy:
+    build: .
+    ports:
+      - "3128:3128"
+    restart: always
+    env_file:
+      - .env

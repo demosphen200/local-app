@@ -1,2 +1,4 @@
 .*
 !.gitginore
+!*.sample
+*.env

@@ -1,0 +1,17 @@
+#template for /etc/systemd/system/setup-vpn-ns.service
+[Unit]
+Description=Setup VPN network namespace with network and DNS
+After=network-online.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/setup-vpn-ns.sh
+ExecStop=/usr/bin/env ip netns delete vpn
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+

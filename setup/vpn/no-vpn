@@ -1,0 +1,24 @@
+#!/bin/bash
+
+if [ $# -eq 0 ]; then
+    echo "Использование: no-vpn2 <команда> [аргументы...]" >&2
+    echo "Пример: MY_VAR=123 no-vpn2 bash" >&2
+    exit 1
+fi
+
+# Получаем имя пользователя
+if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+    USER_TO_RUN="$SUDO_USER"
+else
+    USER_TO_RUN="$USER"
+fi
+
+# Захватываем окружение
+SAVED_ENV=$(export -p | grep -vE ' (UID|EUID|PPID|SUDO_.*|BASH_.*)=')
+
+sudo nsenter -t 1 -n sudo -u "$USER_TO_RUN" bash -c '
+    eval "$1"
+    cd "$2"
+    shift 2
+    "$@"
+' -- "$SAVED_ENV" "$PWD" "$@"

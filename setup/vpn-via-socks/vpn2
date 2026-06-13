@@ -1,0 +1,323 @@
+#!/bin/bash
+#
+# vpn2 — выполняет команду в отдельном сетевом неймспейсе, весь трафик которого
+#        заворачивается в локальную SOCKS5-прокси 127.0.0.1:2080.
+#
+# Использование (аналогично setup/vpn/vpn):
+#     vpn2 <команда> [аргументы...]      выполнить команду в неймспейсе
+#     MY_VAR=123 vpn2 bash               окружение пробрасывается внутрь
+#     vpn2 vpn2 <команда>                вложенный вызов поддерживается
+#     vpn2 --ensure                      только настроить сеть (идемпотентно)
+#     vpn2 --clean                       снести ns/демоны/правила
+#     vpn2 --status                      показать состояние
+#     vpn2 --check                       показать внешний IP: в текущем ns и через vpn2
+#
+# Скрипт сам уходит в основной ns хоста, если запущен из другого ns (например,
+# из 'vpn' в setup/vpn) — оборачивать в no-vpn не нужно.
+#
+# Архитектура (Вариант A):
+#   tun2socks работает ВНУТРИ неймспейса и читает tun-устройство, в которое
+#   уходит весь трафик ns по дефолтному маршруту. Свои SOCKS-соединения
+#   tun2socks открывает к 10.99.99.1:2080 (хостовый конец veth), а хост одним
+#   DNAT-правилом перенаправляет их на 127.0.0.1:2080, где слушает прокси
+#   (неймспейс не видит хостовую петлю напрямую — отсюда этот мостик).
+#
+# Скрипт идемпотентен: при повторных запусках уже созданные ns/veth/tun/правило
+# и работающий демон обнаруживаются и НЕ пересоздаются. За собой ничего не чистит.
+#
+set -uo pipefail
+
+# ------------------------------- параметры ----------------------------------
+NS_NAME="socks"
+
+PROXY_ADDR="127.0.0.1"
+PROXY_PORT="2080"
+
+VETH_HOST="vsk-h"           # хостовый конец veth
+VETH_NS="vsk-n"             # конец veth внутри неймспейса
+VETH_HOST_IP="10.99.99.1"
+VETH_NS_IP="10.99.99.2"
+VETH_PREFIX="30"
+
+TUN_DEV="tun0"              # tun внутри неймспейса (его читает tun2socks)
+TUN_IP="10.99.98.1"
+TUN_PREFIX="24"
+
+# DNS. Прокси режет порт 53, поэтому внутри ns поднимаем DoT-форвардер
+# (dnsproxy): слушает 127.0.0.1:53, ходит к апстриму по DoT(853), который
+# туннелируется через прокси. Апстримы заданы IP-литералами — bootstrap не нужен.
+DNS_LISTEN="127.0.0.1"
+DOT_UPSTREAM1="tls://1.1.1.1:853"
+DOT_UPSTREAM2="tls://1.0.0.1:853"
+DOT_UPSTREAM3="tls://8.8.8.8:853"
+DOT_UPSTREAM4="tls://8.8.4.4:853"
+
+TUN2SOCKS_BIN="${TUN2SOCKS_BIN:-tun2socks}"
+DNSPROXY_BIN="${DNSPROXY_BIN:-dnsproxy}"
+LOGFILE="/var/log/vpn2.log"
+
+# --------------------------------- утилиты -----------------------------------
+log() { echo "[vpn2] $*" >&2; }
+die() { echo "[vpn2] Ошибка: $*" >&2; exit 1; }
+is_root() { [ "$(id -u)" -eq 0 ]; }
+
+# Признак того, что мы УЖЕ внутри неймспейса socks (важно для вложенных вызовов
+# vpn2 vpn2 ... — нельзя считать текущий ns корневым).
+in_target_ns() {
+    [ "$(ip netns identify $$ 2>/dev/null)" = "$NS_NAME" ] && return 0
+    # запасной способ: сравнить inode net-ns текущего процесса и named-ns socks
+    if [ -e "/run/netns/$NS_NAME" ]; then
+        local a b
+        a=$(stat -L -c %i "/proc/self/ns/net" 2>/dev/null)
+        b=$(stat -L -c %i "/run/netns/$NS_NAME" 2>/dev/null)
+        [ -n "$a" ] && [ "$a" = "$b" ] && return 0
+    fi
+    return 1
+}
+
+# tun2socks для нашего tun-устройства уже запущен?
+tun2socks_running() {
+    pgrep -f "tun2socks .*-device $TUN_DEV" >/dev/null 2>&1 \
+        || pgrep -f "tun2socks -device $TUN_DEV" >/dev/null 2>&1
+}
+
+# DoT-форвардер dnsproxy уже запущен?
+dnsproxy_running() {
+    pgrep -f "dnsproxy -l $DNS_LISTEN -p 53" >/dev/null 2>&1
+}
+
+# Всё ли уже создано ранее (вызывать из root). Если да — настройку пропускаем.
+is_ready() {
+    ip netns list 2>/dev/null | grep -qw "$NS_NAME" || return 1
+    ip link show "$VETH_HOST" >/dev/null 2>&1 || return 1
+    ip netns exec "$NS_NAME" ip link show "$TUN_DEV" >/dev/null 2>&1 || return 1
+    tun2socks_running || return 1
+    dnsproxy_running || return 1
+    iptables -t nat -C PREROUTING -i "$VETH_HOST" -p tcp \
+        -d "$VETH_HOST_IP" --dport "$PROXY_PORT" \
+        -j DNAT --to-destination "$PROXY_ADDR:$PROXY_PORT" 2>/dev/null || return 1
+    return 0
+}
+
+# ------------------------- идемпотентная настройка ---------------------------
+ensure_setup() {
+    is_root || die "ensure_setup должен выполняться от root"
+    # системный PATH только для привилегированной настройки (iptables в /usr/sbin).
+    # local не трогает окружение, которое позже уедет в пользовательскую команду.
+    local PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
+    command -v "$TUN2SOCKS_BIN" >/dev/null 2>&1 \
+        || die "не найден '$TUN2SOCKS_BIN' — поставь его: $(dirname "$0")/install.sh"
+    command -v "$DNSPROXY_BIN" >/dev/null 2>&1 \
+        || die "не найден '$DNSPROXY_BIN' — поставь его: $(dirname "$0")/install.sh"
+
+    if is_ready; then
+        return 0   # всё уже создано ранее
+    fi
+    log "Настраиваю окружение (ns=$NS_NAME -> socks5://$PROXY_ADDR:$PROXY_PORT)"
+
+    # 1. неймспейс. Проверяем РАБОТОСПОСОБНОСТЬ (setns), а не просто наличие имени:
+    #    битая ссылка /run/netns/$NS_NAME (пустой файл без nsfs-привязки) тоже
+    #    попадает в `ip netns list`, поэтому grep ненадёжен. Если ns битый —
+    #    сносим его и связанные ресурсы и пересоздаём.
+    if ip netns list 2>/dev/null | grep -qw "$NS_NAME" \
+        && ! ip netns exec "$NS_NAME" true 2>/dev/null; then
+        log "ns $NS_NAME битый — пересоздаю"
+        pkill -f "tun2socks -device $TUN_DEV" 2>/dev/null || true
+        pkill -f "dnsproxy -l $DNS_LISTEN -p 53" 2>/dev/null || true
+        ip link del "$VETH_HOST" 2>/dev/null || true
+        ip netns delete "$NS_NAME" 2>/dev/null || true
+    fi
+    ip netns exec "$NS_NAME" true 2>/dev/null || ip netns add "$NS_NAME"
+
+    # 2. veth-пара (создаём, только если нет ни одного конца)
+    if ! ip link show "$VETH_HOST" >/dev/null 2>&1 \
+        && ! ip netns exec "$NS_NAME" ip link show "$VETH_NS" >/dev/null 2>&1; then
+        ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
+    fi
+    # перенести ns-конец внутрь, если он ещё болтается на хосте
+    if ip link show "$VETH_NS" >/dev/null 2>&1; then
+        ip link set "$VETH_NS" netns "$NS_NAME"
+    fi
+
+    # 3. хостовый конец veth + разрешение маршрутизации в loopback
+    ip addr replace "$VETH_HOST_IP/$VETH_PREFIX" dev "$VETH_HOST"
+    ip link set "$VETH_HOST" up
+    echo 1 > "/proc/sys/net/ipv4/conf/$VETH_HOST/route_localnet"
+    echo 1 > /proc/sys/net/ipv4/conf/all/route_localnet
+
+    # 4. ns-конец veth (используется только для SOCKS-коннекта tun2socks к хосту)
+    ip netns exec "$NS_NAME" ip link set lo up
+    ip netns exec "$NS_NAME" ip addr replace "$VETH_NS_IP/$VETH_PREFIX" dev "$VETH_NS"
+    ip netns exec "$NS_NAME" ip link set "$VETH_NS" up
+
+    # 5. tun-устройство внутри ns + дефолтный маршрут в него
+    if ! ip netns exec "$NS_NAME" ip link show "$TUN_DEV" >/dev/null 2>&1; then
+        ip netns exec "$NS_NAME" ip tuntap add mode tun "$TUN_DEV"
+    fi
+    ip netns exec "$NS_NAME" ip addr replace "$TUN_IP/$TUN_PREFIX" dev "$TUN_DEV"
+    ip netns exec "$NS_NAME" ip link set "$TUN_DEV" up
+    ip netns exec "$NS_NAME" ip route replace default dev "$TUN_DEV"
+
+    # 6. мостик до хостовой петли: ns:10.99.99.1:2080 -> 127.0.0.1:2080
+    iptables -t nat -C PREROUTING -i "$VETH_HOST" -p tcp \
+        -d "$VETH_HOST_IP" --dport "$PROXY_PORT" \
+        -j DNAT --to-destination "$PROXY_ADDR:$PROXY_PORT" 2>/dev/null \
+    || iptables -t nat -A PREROUTING -i "$VETH_HOST" -p tcp \
+        -d "$VETH_HOST_IP" --dport "$PROXY_PORT" \
+        -j DNAT --to-destination "$PROXY_ADDR:$PROXY_PORT"
+
+    # 7. DNS внутри ns — резолвер указываем на локальный DoT-форвардер (см. шаг 9).
+    mkdir -p "/etc/netns/$NS_NAME"
+    printf 'nameserver %s\n' "$DNS_LISTEN" > "/etc/netns/$NS_NAME/resolv.conf"
+
+    # 8. демон tun2socks внутри ns (фоном, без systemd)
+    if ! tun2socks_running; then
+        log "Запускаю tun2socks внутри ns $NS_NAME"
+        ip netns exec "$NS_NAME" setsid "$TUN2SOCKS_BIN" \
+            -device "$TUN_DEV" \
+            -proxy "socks5://$VETH_HOST_IP:$PROXY_PORT" \
+            -interface "$VETH_NS" \
+            -loglevel warn \
+            >>"$LOGFILE" 2>&1 < /dev/null &
+        sleep 0.3
+        tun2socks_running || die "tun2socks не стартовал, смотри $LOGFILE"
+    fi
+
+    # 9. DoT-форвардер dnsproxy внутри ns: 127.0.0.1:53 -> tls://...:853 (через туннель)
+    if ! dnsproxy_running; then
+        log "Запускаю dnsproxy (DoT) внутри ns $NS_NAME"
+        ip netns exec "$NS_NAME" setsid "$DNSPROXY_BIN" \
+            -l "$DNS_LISTEN" -p 53 --ipv6-disabled --upstream-mode parallel \
+            -u "$DOT_UPSTREAM1" -u "$DOT_UPSTREAM2" \
+            -u "$DOT_UPSTREAM3" -u "$DOT_UPSTREAM4" \
+            >>"$LOGFILE" 2>&1 < /dev/null &
+        sleep 0.5
+        dnsproxy_running || die "dnsproxy не стартовал, смотри $LOGFILE"
+    fi
+}
+
+# --------------------------------- снос --------------------------------------
+do_clean() {
+    is_root || die "do_clean должен выполняться от root"
+    local PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
+    log "Сношу всё, связанное с ns $NS_NAME"
+    pkill -f "tun2socks -device $TUN_DEV" 2>/dev/null || true
+    pkill -f "dnsproxy -l $DNS_LISTEN -p 53" 2>/dev/null || true
+    # удаляем DNAT-правило (все дубликаты, если вдруг есть)
+    while iptables -t nat -C PREROUTING -i "$VETH_HOST" -p tcp \
+        -d "$VETH_HOST_IP" --dport "$PROXY_PORT" \
+        -j DNAT --to-destination "$PROXY_ADDR:$PROXY_PORT" 2>/dev/null; do
+        iptables -t nat -D PREROUTING -i "$VETH_HOST" -p tcp \
+            -d "$VETH_HOST_IP" --dport "$PROXY_PORT" \
+            -j DNAT --to-destination "$PROXY_ADDR:$PROXY_PORT" 2>/dev/null || break
+    done
+    ip link del "$VETH_HOST" 2>/dev/null || true   # уносит и vsk-n из ns
+    ip netns delete "$NS_NAME" 2>/dev/null || true
+    rm -rf "/etc/netns/$NS_NAME"
+    log "Готово."
+}
+
+# --------------------------------- статус ------------------------------------
+do_status() {
+    echo "== неймспейс =="; ip netns list 2>/dev/null | grep -w "$NS_NAME" || echo "  нет"
+    echo "== tun2socks =="; tun2socks_running && echo "  работает" || echo "  не запущен"
+    echo "== dnsproxy (DoT) =="; dnsproxy_running && echo "  работает" || echo "  не запущен"
+    echo "== DNAT =="
+    sudo iptables -t nat -S PREROUTING 2>/dev/null | grep "$VETH_HOST_IP" || echo "  нет правила"
+    echo "== маршруты в ns =="
+    sudo ip netns exec "$NS_NAME" ip route 2>/dev/null || echo "  ns недоступен"
+}
+
+# --------------------------------- проверка ----------------------------------
+# Сравниваем внешний IP "как есть" (в том ns, откуда запустили --check) и через
+# vpn2 (трафик ушёл в socks-ns -> прокси). Запускается ДО переключения ns в main,
+# поэтому первый curl честно показывает адрес исходного неймспейса.
+do_check() {
+    local URL="https://api.ipify.org"
+    local CURL=(curl -fsS -4 --max-time 15 "$URL")
+
+    echo "== внешний IP в текущем ns (без vpn2) =="
+    if "${CURL[@]}"; then echo; else echo "  (не удалось получить)"; fi
+
+    echo "== внешний IP через vpn2 =="
+    if "$0" "${CURL[@]}"; then echo; else echo "  (не удалось получить)"; fi
+}
+
+# --------------------------- выполнение команды ------------------------------
+# Внутри ns: окружение и cwd уже унаследованы — просто запускаем команду.
+run_here() {
+    [ $# -ge 1 ] || die "нужна команда"
+    exec "$@"
+}
+
+# На хосте: довести окружение до готовности и войти в ns под нужным юзером.
+run_via_ns() {
+    [ $# -ge 1 ] || { echo "Использование: vpn2 <команда> [аргументы...]" >&2; exit 1; }
+
+    if is_root; then ensure_setup; else sudo "$0" --ensure || exit 1; fi
+
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        USER_TO_RUN="$SUDO_USER"
+    else
+        USER_TO_RUN="${USER:-$(id -un)}"
+    fi
+
+    # сохраняем окружение (как в setup/vpn/vpn)
+    SAVED_ENV=$(export -p | grep -vE ' (UID|EUID|PPID|SUDO_.*|BASH_.*)=')
+
+    sudo ip netns exec "$NS_NAME" sudo -u "$USER_TO_RUN" bash -c '
+        eval "$1"
+        cd "$2"
+        shift 2
+        "$@"
+    ' -- "$SAVED_ENV" "$PWD" "$@"
+}
+
+# Переключиться в основной (хостовый) сетевой неймспейс, сохранив окружение,
+# рабочий каталог и исходного пользователя (через SUDO_USER, который выставит sudo).
+# Нужно, когда vpn2 запущен из чужого ns (например, 'vpn' из setup/vpn): вся
+# настройка (vsk-h, DNAT, route_localnet, прокси) живёт в основном ns хоста.
+switch_to_host() {
+    local saved_env
+    saved_env=$(export -p | grep -vE ' (UID|EUID|PPID|SUDO_.*|BASH_.*)=')
+    # -m -n: входим и в mount-ns, и в net-ns PID 1. mount-ns обязателен, т.к.
+    # именованные сетевые ns — это бинд-маунты в /run/netns, и в приватном
+    # mount-ns вызывающего (например, шелл из 'ip netns exec vpn') ссылка на
+    # socks невалидна ("setting the network namespace socks failed").
+    exec sudo nsenter -t 1 -m -n bash -c '
+        eval "$1"
+        cd "$2"
+        shift 2
+        exec "$@"
+    ' -- "$saved_env" "$PWD" "$0" "$@"
+}
+
+# ---------------------------------- main -------------------------------------
+
+# 0) --check обрабатываем ДО любого переключения ns: первый curl должен идти из
+#    того неймспейса, откуда вызвали (требование «из ns в котором запустили»).
+if [ "${1:-}" = "--check" ]; then
+    do_check
+    exit $?
+fi
+
+# 1) Уже внутри socks-ns (в т.ч. вложенный вызов vpn2 vpn2 ...) — выполняем здесь.
+#    Окружение унаследовано напрямую (sudo его не сбрасывал).
+if in_target_ns; then
+    run_here "$@"
+fi
+
+# 2) Запущены из другого сетевого ns (например, 'vpn') — уходим в основной ns хоста.
+CUR_NS="$(ip netns identify $$ 2>/dev/null || true)"
+if [ -n "$CUR_NS" ] && [ "$CUR_NS" != "$NS_NAME" ]; then
+    switch_to_host "$@"
+fi
+
+# 3) Мы в основном ns хоста.
+case "${1:-}" in
+    --ensure) if is_root; then ensure_setup; else exec sudo "$0" --ensure; fi ;;
+    --clean)  if is_root; then do_clean;     else exec sudo "$0" --clean;  fi ;;
+    --status) do_status ;;
+    "")       echo "Использование: vpn2 <команда> [аргументы...] | --ensure | --clean | --status | --check" >&2; exit 1 ;;
+    *)        run_via_ns "$@" ;;
+esac

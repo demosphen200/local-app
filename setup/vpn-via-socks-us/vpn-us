@@ -1,0 +1,455 @@
+#!/bin/bash
+#
+# vpn-us — выполняет команду в отдельном сетевом неймспейсе (socks-us), весь
+#          трафик которого заворачивается в ВЫШЕСТОЯЩИЙ HTTP-прокси с basic-
+#          авторизацией. Параметры прокси (host/port/user/pass) берутся из .env.
+#
+# Использование (аналогично setup/vpn-via-socks/vpn2):
+#     vpn-us <команда> [аргументы...]      выполнить команду в неймспейсе
+#     MY_VAR=123 vpn-us bash               окружение пробрасывается внутрь
+#     vpn-us vpn-us <команда>              вложенный вызов поддерживается
+#     vpn-us --ensure                      только настроить сеть (идемпотентно)
+#     vpn-us --clean                       снести ns/демоны/правила
+#     vpn-us --status                      показать состояние
+#     vpn-us --check                       показать внешний IP: в текущем ns и через vpn-us
+#
+# Скрипт сам уходит в основной ns хоста, если запущен из другого ns (например,
+# из 'vpn' в setup/vpn или из 'vpn2' в setup/vpn-via-socks).
+#
+# Архитектура:
+#   Внутри неймспейса работает ОДИН движок sing-box, который делает сразу всё:
+#     * tun-inbound — создаёт tun-устройство (tunus), в которое по дефолтному
+#       маршруту уходит весь трафик ns;
+#     * fake-IP DNS — на каждый A-запрос мгновенно выдаёт «талончик» из диапазона
+#       198.18.0.0/15 и запоминает соответствие fakeIP <-> имя. DNS приложений
+#       перехватывается прямо из tun (route action hijack-dns), наружу за DNS
+#       ходить не нужно;
+#     * outbound type=http — соединение с конечным сайтом sing-box открывает к
+#       вышестоящему HTTP-прокси и шлёт ему CONNECT по ИМЕНИ (имя берётся из
+#       fake-IP таблицы). Это принципиально: данный прокси не делает CONNECT к
+#       IP-литералам (режет, например, Cloudflare), но по имени — соединяет.
+#
+#   Свои исходящие соединения к удалённому HTTP-прокси sing-box открывает наружу
+#   через veth (vsu-n), а хост их маршрутизирует/маскарадит в интернет. Внутри ns
+#   стоит /32-маршрут до IP прокси через хостовый конец veth, чтобы эти соединения
+#   не уходили обратно в tun (иначе была бы петля).
+#
+# Отличие от setup/vpn-via-socks/vpn2: там аплинк — локальный SOCKS5 на хостовой
+# петле (мостик через DNAT), и tun2socks гонит трафик по IP. Здесь аплинк —
+# внешний HTTP-прокси, поэтому ip_forward + MASQUERADE, а имя хоста сохраняется
+# до прокси через fake-IP (иначе прокси режет CONNECT по IP).
+#
+# Все имена интерфейсов и подсети намеренно отличаются от socks-ns, чтобы два
+# окружения сосуществовали без пересечений.
+#
+# Скрипт идемпотентен: при повторных запусках уже созданные ns/veth/tun/правила
+# и работающий sing-box обнаруживаются и НЕ пересоздаются. За собой ничего не чистит.
+#
+set -uo pipefail
+
+# ------------------------------- параметры ----------------------------------
+NS_NAME="socks-us"
+
+VETH_HOST="vsu-h"           # хостовый конец veth
+VETH_NS="vsu-n"             # конец veth внутри неймспейса
+VETH_HOST_IP="10.99.97.1"
+VETH_NS_IP="10.99.97.2"
+VETH_PREFIX="30"
+VETH_SUBNET="10.99.97.0/30"
+
+TUN_DEV="tunus"            # tun внутри ns (его создаёт и читает sing-box)
+TUN_IP="10.99.96.1"
+TUN_PREFIX="24"
+TUN_MTU="1500"
+
+# Диапазоны fake-IP. В реальном интернете не встречаются (RFC 2544 / ULA), так
+# что коллизий с настоящими адресами нет.
+FAKEIP4_RANGE="198.18.0.0/15"
+FAKEIP6_RANGE="fc00::/18"
+
+# resolv.conf внутри ns указывает сюда. Адрес-заглушка: DNS-запрос всё равно
+# уходит по дефолтному маршруту в tun и перехватывается sing-box (hijack-dns),
+# до этого IP пакет физически не доходит.
+DNS_STUB="1.1.1.1"
+
+# Реальный DoT-резолвер. Нужен лишь как dns.final: sing-box не разрешает делать
+# fakeip-сервер «final». Весь рабочий трафик (A/AAAA) уходит на fakeip правилом и
+# до этого резолвера НЕ доходит; сюда попадают только редкие прочие типы запросов
+# (например HTTPS/65). Его собственные соединения sing-box открывает через прокси
+# (CONNECT 1.1.1.1:853 — этот IP прокси достижим).
+DOT_RESOLVER="1.1.1.1"
+DOT_RESOLVER_PORT="853"
+
+SINGBOX_BIN="${SINGBOX_BIN:-sing-box}"
+LOGFILE="/var/log/vpn-us.log"
+CONFIG_DIR="/run/vpn-us"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+
+# --- параметры вышестоящего HTTP-прокси (из .env) ----------------------------
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# Порядок поиска .env: явный VPN_US_ENV -> рядом со скриптом -> /etc/vpn-us.env
+ENV_FILE=""
+for cand in "${VPN_US_ENV:-}" "$SCRIPT_DIR/.env" "/etc/vpn-us.env"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { ENV_FILE="$cand"; break; }
+done
+
+PROXY_HOST=""; PROXY_PORT=""; PROXY_USER=""; PROXY_PASS=""
+if [ -n "$ENV_FILE" ]; then
+    # читаем как набор KEY=VALUE (без исполнения произвольного кода)
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+fi
+
+# --------------------------------- утилиты -----------------------------------
+log() { echo "[vpn-us] $*" >&2; }
+die() { echo "[vpn-us] Ошибка: $*" >&2; exit 1; }
+is_root() { [ "$(id -u)" -eq 0 ]; }
+
+# экранирование строки для вставки в JSON-литерал (логин/пароль прокси)
+json_str() {
+    local s="$1" out="" c i
+    for ((i=0; i<${#s}; i++)); do
+        c="${s:i:1}"
+        case "$c" in
+            '"')   out+='\"' ;;
+            '\')   out+='\\' ;;
+            $'\n') out+='\n' ;;
+            $'\r') out+='\r' ;;
+            $'\t') out+='\t' ;;
+            *)     out+="$c" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+require_proxy_env() {
+    [ -n "$ENV_FILE" ] || die "не найден .env с параметрами прокси (искал \$VPN_US_ENV, $SCRIPT_DIR/.env, /etc/vpn-us.env)"
+    [ -n "$PROXY_HOST" ] || die "в $ENV_FILE не задан PROXY_HOST"
+    [ -n "$PROXY_PORT" ] || die "в $ENV_FILE не задан PROXY_PORT"
+    [ -n "$PROXY_USER" ] || die "в $ENV_FILE не задан PROXY_USER"
+    [ -n "$PROXY_PASS" ] || die "в $ENV_FILE не задан PROXY_PASS"
+    [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] || die "PROXY_PORT должен быть числом (сейчас: $PROXY_PORT)"
+}
+
+# то же, что в конфиге, но без пароля — для логов
+proxy_display_safe() { printf 'http://%s:***@%s:%s' "$PROXY_USER" "$PROXY_HOST" "$PROXY_PORT"; }
+
+# config.json для sing-box. Регенерируется при каждом ensure из .env, лежит в
+# tmpfs (/run) с правами 600 — пароль не оседает на диске.
+write_config() {
+    local u p
+    u="$(json_str "$PROXY_USER")"
+    p="$(json_str "$PROXY_PASS")"
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    ( umask 077; cat > "$CONFIG_FILE" <<EOF
+{
+  "log": { "level": "warn", "timestamp": true },
+  "dns": {
+    "servers": [
+      { "type": "fakeip", "tag": "fakeip", "inet4_range": "$FAKEIP4_RANGE", "inet6_range": "$FAKEIP6_RANGE" },
+      { "type": "tls", "tag": "dot", "server": "$DOT_RESOLVER", "server_port": $DOT_RESOLVER_PORT }
+    ],
+    "rules": [
+      { "query_type": ["A", "AAAA"], "action": "route", "server": "fakeip" }
+    ],
+    "independent_cache": true,
+    "final": "dot"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "$TUN_DEV",
+      "address": ["$TUN_IP/$TUN_PREFIX"],
+      "mtu": $TUN_MTU,
+      "auto_route": false,
+      "strict_route": false,
+      "stack": "gvisor"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "http",
+      "tag": "proxy",
+      "server": "$PROXY_HOST",
+      "server_port": $PROXY_PORT,
+      "username": "$u",
+      "password": "$p",
+      "bind_interface": "$VETH_NS"
+    }
+  ],
+  "route": {
+    "default_interface": "$VETH_NS",
+    "rules": [
+      { "port": [53], "action": "hijack-dns" }
+    ],
+    "final": "proxy"
+  }
+}
+EOF
+    )
+    chmod 600 "$CONFIG_FILE"
+}
+
+# Признак того, что мы УЖЕ внутри неймспейса socks-us (важно для вложенных вызовов
+# vpn-us vpn-us ... — нельзя считать текущий ns корневым).
+in_target_ns() {
+    [ "$(ip netns identify $$ 2>/dev/null)" = "$NS_NAME" ] && return 0
+    if [ -e "/run/netns/$NS_NAME" ]; then
+        local a b
+        a=$(stat -L -c %i "/proc/self/ns/net" 2>/dev/null)
+        b=$(stat -L -c %i "/run/netns/$NS_NAME" 2>/dev/null)
+        [ -n "$a" ] && [ "$a" = "$b" ] && return 0
+    fi
+    return 1
+}
+
+# Есть ли в нашем ns процесс с данным comm-именем (различение по ns, не по cmdline,
+# чтобы не зацепить одноимённые демоны соседнего ns). Требует root.
+_ns_has_proc() {
+    local name="$1" p
+    for p in $(ip netns pids "$NS_NAME" 2>/dev/null); do
+        [ "$(cat "/proc/$p/comm" 2>/dev/null)" = "$name" ] && return 0
+    done
+    return 1
+}
+singbox_running() { _ns_has_proc sing-box; }
+
+# Всё ли уже создано ранее (вызывать из root). Если да — настройку пропускаем.
+is_ready() {
+    ip netns list 2>/dev/null | grep -qw "$NS_NAME" || return 1
+    ip link show "$VETH_HOST" >/dev/null 2>&1 || return 1
+    ip netns exec "$NS_NAME" ip link show "$TUN_DEV" >/dev/null 2>&1 || return 1
+    singbox_running || return 1
+    iptables -t nat -C POSTROUTING -s "$VETH_SUBNET" -j MASQUERADE 2>/dev/null || return 1
+    iptables -C FORWARD -i "$VETH_HOST" -j ACCEPT 2>/dev/null || return 1
+    iptables -C FORWARD -o "$VETH_HOST" -j ACCEPT 2>/dev/null || return 1
+    ip netns exec "$NS_NAME" ip route show "$PROXY_HOST" 2>/dev/null | grep -q . || return 1
+    ip netns exec "$NS_NAME" ip route show default 2>/dev/null | grep -qw "$TUN_DEV" || return 1
+    return 0
+}
+
+# ------------------------- идемпотентная настройка ---------------------------
+ensure_setup() {
+    is_root || die "ensure_setup должен выполняться от root"
+    require_proxy_env
+    # системный PATH только для привилегированной настройки (iptables в /usr/sbin).
+    local PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
+    command -v "$SINGBOX_BIN" >/dev/null 2>&1 \
+        || die "не найден '$SINGBOX_BIN' — поставь его: $SCRIPT_DIR/install.sh"
+
+    if is_ready; then
+        return 0   # всё уже создано ранее
+    fi
+    log "Настраиваю окружение (ns=$NS_NAME -> $(proxy_display_safe))"
+
+    # 1. неймспейс. Проверяем РАБОТОСПОСОБНОСТЬ (setns), а не просто наличие имени:
+    #    битая ссылка /run/netns/$NS_NAME тоже попадает в `ip netns list`. Если
+    #    ns битый — сносим его и связанные ресурсы и пересоздаём.
+    if ip netns list 2>/dev/null | grep -qw "$NS_NAME" \
+        && ! ip netns exec "$NS_NAME" true 2>/dev/null; then
+        log "ns $NS_NAME битый — пересоздаю"
+        for p in $(ip netns pids "$NS_NAME" 2>/dev/null); do kill "$p" 2>/dev/null || true; done
+        ip link del "$VETH_HOST" 2>/dev/null || true
+        ip netns delete "$NS_NAME" 2>/dev/null || true
+    fi
+    ip netns exec "$NS_NAME" true 2>/dev/null || ip netns add "$NS_NAME"
+
+    # 2. veth-пара (создаём, только если нет ни одного конца)
+    if ! ip link show "$VETH_HOST" >/dev/null 2>&1 \
+        && ! ip netns exec "$NS_NAME" ip link show "$VETH_NS" >/dev/null 2>&1; then
+        ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
+    fi
+    # перенести ns-конец внутрь, если он ещё болтается на хосте
+    if ip link show "$VETH_NS" >/dev/null 2>&1; then
+        ip link set "$VETH_NS" netns "$NS_NAME"
+    fi
+
+    # 3. хостовый конец veth + форвардинг наружу
+    ip addr replace "$VETH_HOST_IP/$VETH_PREFIX" dev "$VETH_HOST"
+    ip link set "$VETH_HOST" up
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+
+    # 4. ns-конец veth + поднимаем lo (для исходящих sing-box к прокси)
+    ip netns exec "$NS_NAME" ip link set lo up
+    ip netns exec "$NS_NAME" ip addr replace "$VETH_NS_IP/$VETH_PREFIX" dev "$VETH_NS"
+    ip netns exec "$NS_NAME" ip link set "$VETH_NS" up
+
+    # 5. /32-маршрут до IP прокси через хостовый veth — чтобы соединения sing-box
+    #    к прокси шли наружу, а не обратно в tun (петля). PROXY_HOST должен быть
+    #    IP-литералом; если это имя — резолвим заранее на хосте.
+    local proxy_ip="$PROXY_HOST"
+    if ! [[ "$proxy_ip" =~ ^[0-9.]+$ ]]; then
+        proxy_ip="$(getent ahostsv4 "$PROXY_HOST" | awk '{print $1; exit}')"
+        [ -n "$proxy_ip" ] || die "не удалось разрезолвить PROXY_HOST=$PROXY_HOST"
+    fi
+    ip netns exec "$NS_NAME" ip route replace "$proxy_ip/32" via "$VETH_HOST_IP" dev "$VETH_NS"
+
+    # 6. masquerade + разрешение форвардинга для подсети veth
+    iptables -t nat -C POSTROUTING -s "$VETH_SUBNET" -j MASQUERADE 2>/dev/null \
+        || iptables -t nat -A POSTROUTING -s "$VETH_SUBNET" -j MASQUERADE
+    iptables -C FORWARD -i "$VETH_HOST" -j ACCEPT 2>/dev/null \
+        || iptables -A FORWARD -i "$VETH_HOST" -j ACCEPT
+    iptables -C FORWARD -o "$VETH_HOST" -j ACCEPT 2>/dev/null \
+        || iptables -A FORWARD -o "$VETH_HOST" -j ACCEPT
+
+    # 7. DNS внутри ns — резолвер-заглушка (запросы перехватит sing-box из tun).
+    mkdir -p "/etc/netns/$NS_NAME"
+    printf 'nameserver %s\n' "$DNS_STUB" > "/etc/netns/$NS_NAME/resolv.conf"
+
+    # 8. временный дефолтный маршрут через veth — чтобы сетевой монитор sing-box
+    #    при старте видел дефолтный интерфейс (иначе одноразовый ERROR "missing
+    #    default interface": tun ещё не создан, дефолта в ns нет). Сразу после
+    #    создания tun дефолт переключается в tun (шаг 10). Утечки нет: трафика
+    #    приложений в ns на этот момент нет, а соединение sing-box к прокси и так
+    #    идёт по более точному /32-маршруту через veth.
+    ip netns exec "$NS_NAME" ip route replace default via "$VETH_HOST_IP" dev "$VETH_NS"
+
+    # 9. конфиг + запуск sing-box внутри ns (фоном, без systemd)
+    write_config
+    if ! singbox_running; then
+        log "Запускаю sing-box внутри ns $NS_NAME"
+        ip netns exec "$NS_NAME" setsid "$SINGBOX_BIN" run -c "$CONFIG_FILE" \
+            >>"$LOGFILE" 2>&1 < /dev/null &
+        # ждём, пока sing-box создаст tun-устройство
+        local n
+        for ((n=0; n<50; n++)); do
+            ip netns exec "$NS_NAME" ip link show "$TUN_DEV" >/dev/null 2>&1 && break
+            sleep 0.1
+        done
+        singbox_running || die "sing-box не стартовал, смотри $LOGFILE"
+        ip netns exec "$NS_NAME" ip link show "$TUN_DEV" >/dev/null 2>&1 \
+            || die "sing-box не создал $TUN_DEV, смотри $LOGFILE"
+    fi
+
+    # 10. дефолтный маршрут в tun (sing-box при auto_route=false его не ставит;
+    #     заменяет временный дефолт через veth из шага 8). Egress самого sing-box
+    #     остаётся на veth (route.default_interface + bind_interface), петли нет.
+    ip netns exec "$NS_NAME" ip route replace default dev "$TUN_DEV"
+}
+
+# --------------------------------- снос --------------------------------------
+do_clean() {
+    is_root || die "do_clean должен выполняться от root"
+    local PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
+    log "Сношу всё, связанное с ns $NS_NAME"
+    # убиваем процессы строго в нашем ns (не трогаем соседний socks-ns)
+    for p in $(ip netns pids "$NS_NAME" 2>/dev/null); do kill "$p" 2>/dev/null || true; done
+    # удаляем правила nat/forward (все дубликаты, если вдруг есть)
+    while iptables -t nat -C POSTROUTING -s "$VETH_SUBNET" -j MASQUERADE 2>/dev/null; do
+        iptables -t nat -D POSTROUTING -s "$VETH_SUBNET" -j MASQUERADE 2>/dev/null || break
+    done
+    while iptables -C FORWARD -i "$VETH_HOST" -j ACCEPT 2>/dev/null; do
+        iptables -D FORWARD -i "$VETH_HOST" -j ACCEPT 2>/dev/null || break
+    done
+    while iptables -C FORWARD -o "$VETH_HOST" -j ACCEPT 2>/dev/null; do
+        iptables -D FORWARD -o "$VETH_HOST" -j ACCEPT 2>/dev/null || break
+    done
+    ip link del "$VETH_HOST" 2>/dev/null || true   # уносит и vsu-n из ns
+    ip netns delete "$NS_NAME" 2>/dev/null || true
+    rm -rf "/etc/netns/$NS_NAME"
+    rm -f "$CONFIG_FILE"
+    log "Готово."
+}
+
+# --------------------------------- статус ------------------------------------
+do_status() {
+    echo "== неймспейс =="; ip netns list 2>/dev/null | grep -w "$NS_NAME" || echo "  нет"
+    echo "== sing-box =="; sudo "$0" --is-running sing-box && echo "  работает" || echo "  не запущен"
+    echo "== NAT/MASQUERADE =="
+    sudo iptables -t nat -S POSTROUTING 2>/dev/null | grep "$VETH_SUBNET" || echo "  нет правила"
+    echo "== FORWARD =="
+    sudo iptables -S FORWARD 2>/dev/null | grep "$VETH_HOST" || echo "  нет правил"
+    echo "== маршруты в ns =="
+    sudo ip netns exec "$NS_NAME" ip route 2>/dev/null || echo "  ns недоступен"
+}
+
+# --------------------------------- проверка ----------------------------------
+do_check() {
+    local URL="https://api.ipify.org"
+    local CURL=(curl -fsS -4 --max-time 15 "$URL")
+
+    echo "== внешний IP в текущем ns (без vpn-us) =="
+    if "${CURL[@]}"; then echo; else echo "  (не удалось получить)"; fi
+
+    echo "== внешний IP через vpn-us =="
+    if "$0" "${CURL[@]}"; then echo; else echo "  (не удалось получить)"; fi
+}
+
+# --------------------------- выполнение команды ------------------------------
+run_here() {
+    [ $# -ge 1 ] || die "нужна команда"
+    exec "$@"
+}
+
+run_via_ns() {
+    [ $# -ge 1 ] || { echo "Использование: vpn-us <команда> [аргументы...]" >&2; exit 1; }
+
+    if is_root; then ensure_setup; else sudo "$0" --ensure || exit 1; fi
+
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        USER_TO_RUN="$SUDO_USER"
+    else
+        USER_TO_RUN="${USER:-$(id -un)}"
+    fi
+
+    SAVED_ENV=$(export -p | grep -vE ' (UID|EUID|PPID|SUDO_.*|BASH_.*)=')
+
+    sudo ip netns exec "$NS_NAME" sudo -u "$USER_TO_RUN" bash -c '
+        eval "$1"
+        cd "$2"
+        shift 2
+        "$@"
+    ' -- "$SAVED_ENV" "$PWD" "$@"
+}
+
+switch_to_host() {
+    local saved_env
+    saved_env=$(export -p | grep -vE ' (UID|EUID|PPID|SUDO_.*|BASH_.*)=')
+    exec sudo nsenter -t 1 -m -n bash -c '
+        eval "$1"
+        cd "$2"
+        shift 2
+        exec "$@"
+    ' -- "$saved_env" "$PWD" "$0" "$@"
+}
+
+# ---------------------------------- main -------------------------------------
+
+# Внутренняя точка для do_status (нужен root, чтобы прочитать pids ns).
+if [ "${1:-}" = "--is-running" ]; then
+    case "${2:-}" in
+        sing-box) singbox_running; exit $? ;;
+        *) exit 2 ;;
+    esac
+fi
+
+# 0) --check обрабатываем ДО любого переключения ns: первый curl должен идти из
+#    того неймспейса, откуда вызвали.
+if [ "${1:-}" = "--check" ]; then
+    do_check
+    exit $?
+fi
+
+# 1) Уже внутри socks-us-ns (в т.ч. вложенный вызов vpn-us vpn-us ...) — здесь.
+if in_target_ns; then
+    run_here "$@"
+fi
+
+# 2) Запущены из другого сетевого ns — уходим в основной ns хоста.
+CUR_NS="$(ip netns identify $$ 2>/dev/null || true)"
+if [ -n "$CUR_NS" ] && [ "$CUR_NS" != "$NS_NAME" ]; then
+    switch_to_host "$@"
+fi
+
+# 3) Мы в основном ns хоста.
+case "${1:-}" in
+    --ensure) if is_root; then ensure_setup; else exec sudo "$0" --ensure; fi ;;
+    --clean)  if is_root; then do_clean;     else exec sudo "$0" --clean;  fi ;;
+    --status) do_status ;;
+    "")       echo "Использование: vpn-us <команда> [аргументы...] | --ensure | --clean | --status | --check" >&2; exit 1 ;;
+    *)        run_via_ns "$@" ;;
+esac

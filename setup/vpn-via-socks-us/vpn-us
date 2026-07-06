@@ -139,9 +139,18 @@ proxy_display_safe() { printf 'http://%s:***@%s:%s' "$PROXY_USER" "$PROXY_HOST" 
 # config.json для sing-box. Регенерируется при каждом ensure из .env, лежит в
 # tmpfs (/run) с правами 600 — пароль не оседает на диске.
 write_config() {
-    local u p
+    local u p server_ip
     u="$(json_str "$PROXY_USER")"
     p="$(json_str "$PROXY_PASS")"
+    # В server http-outbound кладём IP-литерал, а не домен: иначе sing-box
+    # пытается резолвить адрес прокси через dns-резолвер, который сам ходит
+    # через этот же прокси → петля. IP резолвим один раз здесь (host DNS на
+    # этапе ensure_setup рабочий — тем же getent ставится /32-маршрут).
+    server_ip="$PROXY_HOST"
+    if ! [[ "$server_ip" =~ ^[0-9.]+$ ]]; then
+        server_ip="$(getent ahostsv4 "$PROXY_HOST" | awk '{print $1; exit}')"
+        [ -n "$server_ip" ] || die "не удалось разрезолвить PROXY_HOST=$PROXY_HOST"
+    fi
     mkdir -p "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR"
     ( umask 077; cat > "$CONFIG_FILE" <<EOF
@@ -174,7 +183,7 @@ write_config() {
     {
       "type": "http",
       "tag": "proxy",
-      "server": "$PROXY_HOST",
+      "server": "$server_ip",
       "server_port": $PROXY_PORT,
       "username": "$u",
       "password": "$p",
@@ -183,6 +192,7 @@ write_config() {
   ],
   "route": {
     "default_interface": "$VETH_NS",
+    "default_domain_resolver": { "server": "dot" },
     "rules": [
       { "port": [53], "action": "hijack-dns" }
     ],

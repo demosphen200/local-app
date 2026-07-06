@@ -22,26 +22,61 @@
         dest: "/usr/local/bin/kubectl"
         mode: "0755"
 
-#- name: Install Helm
-#  block:
-#    - name: Download Helm GPG key
-#      ansible.builtin.shell: |
-#        curl -fsSL https://packages.buildkite.com/helm-linux/helm-debian/gpgkey | gpg --dearmor -o /usr/share/keyrings/helm.gpg
-#      args:
-#        creates: /usr/share/keyrings/helm.gpg
-#
-#    - name: Add Helm repository
-#      ansible.builtin.apt_repository:
-#        repo: "deb [signed-by=/usr/share/keyrings/helm.gpg] https://packages.buildkite.com/helm-linux/helm-debian/any/ any main"
-#        filename: helm-stable-debian
-#        state: present
-#        update_cache: yes
-#
-#    - name: Install Helm package
-#      ansible.builtin.apt:
-#        name: helm
-#        state: present
-#
+- name: Install Helm
+  vars:
+    helm_version: "3.21.2"
+  ansible.builtin.unarchive:
+    src: "https://get.helm.sh/helm-v{{ helm_version }}-linux-amd64.tar.gz"
+    dest: /usr/local/bin
+    remote_src: yes
+    extra_opts:
+      - --strip-components=1
+    include:
+      - linux-amd64/helm
+    mode: "0755"
+
+- name: Install Helmfile
+  vars:
+    helmfile_version: "1.7.0"
+  ansible.builtin.unarchive:
+    src: "https://github.com/helmfile/helmfile/releases/download/v{{ helmfile_version }}/helmfile_{{ helmfile_version }}_linux_amd64.tar.gz"
+    dest: /usr/local/bin
+    remote_src: yes
+    include:
+      - helmfile
+    mode: "0755"
+
+- name: Install age (for SOPS)
+  ansible.builtin.apt:
+    name: age
+    state: present
+
+- name: Install SOPS
+  vars:
+    sops_version: "3.13.2"
+  ansible.builtin.get_url:
+    url: "https://github.com/getsops/sops/releases/download/v{{ sops_version }}/sops-v{{ sops_version }}.linux.amd64"
+    dest: /usr/local/bin/sops
+    mode: "0755"
+    timeout: 60
+
+- name: Install Helm plugins
+  become_user: ext
+  block:
+    - name: Get installed Helm plugins
+      ansible.builtin.command: helm plugin list
+      register: helm_plugins
+      changed_when: false
+
+    - name: Install Helm plugins
+      ansible.builtin.command: "helm plugin install {{ item.url }}"
+      loop:
+        - { name: diff, url: "https://github.com/databus23/helm-diff" }
+        - { name: secrets, url: "https://github.com/jkroepke/helm-secrets" }
+        - { name: helm-git, url: "https://github.com/aslafy-z/helm-git" }
+      when: item.name not in helm_plugins.stdout
+      changed_when: true
+
 #- name: Install Kubernetes Lens IDE
 #  block:
 #    - name: Download Lens GPG key

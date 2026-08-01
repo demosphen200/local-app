@@ -1,33 +1,21 @@
+# установка (кладёт vpn и no-vpn в /usr/local/bin, гасит старый systemd-юнит)
+./install.sh
 
+# управление неймспейсом
+vpn --ensure          # поднять сеть в ns (идемпотентно, вызывается автоматически)
+vpn --status          # что сейчас настроено
+vpn --check           # внешний IP: в текущем ns и через vpn
+vpn --clean           # снести ns, вернуть ens36 на хост
 
+# запуск команд
+vpn bash
+MY_VAR=123 vpn bash
+vpn curl -s https://ifconfig.me ; echo
+no-vpn <команда>      # выполнить в основном ns хоста (изнутри vpn/socks)
 
-
-
-sudo systemctl daemon-reload
-
-sudo systemctl enable setup-vpn-ns.service
-
-sudo systemctl start setup-vpn-ns.service
-
-sudo systemctl status setup-vpn-ns.service
-
-sudo journalctl -u setup-vpn-ns.service -f
-
-sudo systemctl stop setup-vpn-ns.service
-
-sudo systemctl restart setup-vpn-ns.service
-
-sudo systemctl disable setup-vpn-ns.service
-
-
-
+# ручные проверки
 sudo ip netns exec vpn ip addr show ens36
-
 sudo ip netns exec vpn ip route show
-
 sudo ip netns exec vpn cat /etc/resolv.conf
-
 sudo ip netns exec vpn ping -c 3 google.com
-
 sudo ip netns exec vpn sudo -u $USER bash
-

@@ -1,33 +1,256 @@
 #!/bin/bash
+#
+# vpn — выполняет команду в сетевом неймспейсе, куда целиком отдан физический
+#       интерфейс VPN-сети ($IFACE). Весь трафик команды идёт через этот
+#       интерфейс и его шлюз, хостовая сеть при этом не затрагивается.
+#
+# Использование:
+#     vpn <команда> [аргументы...]      выполнить команду в неймспейсе
+#     MY_VAR=123 vpn bash               окружение пробрасывается внутрь
+#     vpn vpn <команда>                 вложенный вызов поддерживается
+#     vpn --ensure                      только настроить сеть (идемпотентно)
+#     vpn --clean                       снести ns и вернуть интерфейс хосту
+#     vpn --status                      показать состояние
+#     vpn --check                       показать внешний IP: в текущем ns и через vpn
+#
+# Скрипт сам уходит в основной ns хоста, если запущен из другого ns (например,
+# из 'vpn2' в setup/vpn-via-socks) — оборачивать в no-vpn не нужно.
+#
+# Архитектура:
+#   $IFACE переносится ЦЕЛИКОМ внутрь неймспейса (ip link set ... netns), там ему
+#   назначается статический адрес и дефолтный маршрут через VPN-шлюз. На хосте
+#   интерфейс при этом исчезает — хостовая маршрутизация не меняется вообще.
+#   DNS для ns берётся из /etc/netns/$NS_NAME/resolv.conf: 'ip netns exec'
+#   бинд-маунтит файлы оттуда поверх /etc/ в приватном mount-ns команды.
+#
+# Скрипт идемпотентен: при повторных запусках уже созданный ns и настроенный
+# интерфейс обнаруживаются и НЕ пересоздаются. За собой ничего не чистит —
+# для сноса есть --clean.
+#
+set -uo pipefail
 
+# ------------------------------- параметры ----------------------------------
 NS_NAME="vpn"
+IFACE="ens36"               # физический интерфейс VPN-сети, уезжает внутрь ns
+NS_IP="172.16.103.102"
+NS_PREFIX="24"
+NS_GW="172.16.103.249"
 
-if ! ip netns list | grep -q "$NS_NAME"; then
-    echo "Ошибка: Неймспейс '$NS_NAME' не существует" >&2
-    echo "Запустите сначала: sudo systemctl start setup-vpn-ns.service" >&2
-    exit 1
+DNS1="8.8.8.8"
+DNS2="8.8.4.4"
+
+# --------------------------------- утилиты -----------------------------------
+log() { echo "[vpn] $*" >&2; }
+die() { echo "[vpn] Ошибка: $*" >&2; exit 1; }
+is_root() { [ "$(id -u)" -eq 0 ]; }
+
+# Признак того, что мы УЖЕ внутри неймспейса vpn (важно для вложенных вызовов
+# vpn vpn ... — нельзя считать текущий ns корневым).
+in_target_ns() {
+    [ "$(ip netns identify $$ 2>/dev/null)" = "$NS_NAME" ] && return 0
+    # запасной способ: сравнить inode net-ns текущего процесса и named-ns vpn
+    if [ -e "/run/netns/$NS_NAME" ]; then
+        local a b
+        a=$(stat -L -c %i "/proc/self/ns/net" 2>/dev/null)
+        b=$(stat -L -c %i "/run/netns/$NS_NAME" 2>/dev/null)
+        [ -n "$a" ] && [ "$a" = "$b" ] && return 0
+    fi
+    return 1
+}
+
+ns_usable() { ip netns exec "$NS_NAME" true 2>/dev/null; }
+iface_in_ns() { ip netns exec "$NS_NAME" ip link show "$IFACE" >/dev/null 2>&1; }
+iface_on_host() { ip link show "$IFACE" >/dev/null 2>&1; }
+
+# Всё ли уже создано и настроено ранее (вызывать из root). Если да — пропускаем.
+is_ready() {
+    ns_usable || return 1
+    iface_in_ns || return 1
+    ip netns exec "$NS_NAME" ip -4 addr show dev "$IFACE" 2>/dev/null \
+        | grep -qw "$NS_IP/$NS_PREFIX" || return 1
+    ip netns exec "$NS_NAME" ip route show default 2>/dev/null \
+        | grep -qw "$NS_GW" || return 1
+    return 0
+}
+
+# ------------------------- идемпотентная настройка ---------------------------
+ensure_setup() {
+    is_root || die "ensure_setup должен выполняться от root"
+    # системный PATH только для привилегированной настройки (ip в /usr/sbin).
+    # local не трогает окружение, которое позже уедет в пользовательскую команду.
+    local PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
+
+    if is_ready; then
+        return 0   # всё уже создано ранее
+    fi
+
+    # 1. неймспейс. Проверяем РАБОТОСПОСОБНОСТЬ (setns), а не просто наличие имени:
+    #    битая ссылка /run/netns/$NS_NAME (пустой файл без nsfs-привязки) тоже
+    #    попадает в `ip netns list`, поэтому grep ненадёжен. Если ns битый —
+    #    сносим и пересоздаём (физический интерфейс при удалении ns сам
+    #    возвращается в основной неймспейс).
+    if ip netns list 2>/dev/null | grep -qw "$NS_NAME" && ! ns_usable; then
+        log "ns $NS_NAME битый — пересоздаю"
+        ip netns delete "$NS_NAME" 2>/dev/null || true
+        sleep 0.3
+    fi
+    if ! ns_usable; then
+        log "Создаю неймспейс $NS_NAME"
+        ip netns add "$NS_NAME" || die "не удалось создать ns $NS_NAME"
+    fi
+
+    # 2. физический интерфейс: переносим внутрь ns, если он ещё на хосте
+    if ! iface_in_ns; then
+        iface_on_host || die "интерфейс $IFACE не найден ни на хосте, ни в ns $NS_NAME"
+        log "Переношу $IFACE в ns $NS_NAME"
+        ip link set "$IFACE" netns "$NS_NAME" \
+            || die "не удалось перенести $IFACE в ns (интерфейс занят NetworkManager?)"
+    fi
+
+    # 3. адрес, поднятие, дефолтный маршрут внутри ns
+    log "Настраиваю сеть в ns: $IFACE $NS_IP/$NS_PREFIX, шлюз $NS_GW"
+    ip netns exec "$NS_NAME" ip link set lo up
+    ip netns exec "$NS_NAME" ip addr replace "$NS_IP/$NS_PREFIX" dev "$IFACE"
+    ip netns exec "$NS_NAME" ip link set "$IFACE" up
+    ip netns exec "$NS_NAME" ip route replace default via "$NS_GW" dev "$IFACE" \
+        || die "не удалось поставить дефолтный маршрут через $NS_GW"
+
+    # 4. DNS внутри ns (бинд-маунтится поверх /etc/resolv.conf в 'ip netns exec')
+    mkdir -p "/etc/netns/$NS_NAME"
+    printf 'nameserver %s\nnameserver %s\n' "$DNS1" "$DNS2" \
+        > "/etc/netns/$NS_NAME/resolv.conf"
+
+    is_ready || die "настройка не завершилась, смотри 'vpn --status'"
+}
+
+# --------------------------------- снос --------------------------------------
+do_clean() {
+    is_root || die "do_clean должен выполняться от root"
+    local PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
+    log "Сношу ns $NS_NAME"
+    # удаление ns автоматически возвращает физический интерфейс в основной ns
+    # (без адресов и в состоянии DOWN — хостовая настройка, если она была,
+    # восстанавливается средствами NetworkManager/ifupdown).
+    ip netns delete "$NS_NAME" 2>/dev/null || true
+    rm -rf "/etc/netns/$NS_NAME"
+    if iface_on_host; then
+        log "$IFACE вернулся на хост (DOWN, без адреса)"
+    else
+        log "ВНИМАНИЕ: $IFACE не появился на хосте — проверь 'ip link'"
+    fi
+    log "Готово."
+}
+
+# --------------------------------- статус ------------------------------------
+do_status() {
+    echo "== неймспейс =="; ip netns list 2>/dev/null | grep -w "$NS_NAME" || echo "  нет"
+    echo "== $IFACE =="
+    if sudo ip netns exec "$NS_NAME" ip -br addr show dev "$IFACE" 2>/dev/null; then :
+    elif ip -br addr show dev "$IFACE" 2>/dev/null; then echo "  (на хосте, не в ns)"
+    else echo "  не найден"; fi
+    echo "== маршруты в ns =="
+    sudo ip netns exec "$NS_NAME" ip route 2>/dev/null || echo "  ns недоступен"
+    echo "== DNS в ns =="
+    cat "/etc/netns/$NS_NAME/resolv.conf" 2>/dev/null || echo "  нет resolv.conf"
+}
+
+# --------------------------------- проверка ----------------------------------
+# Сравниваем внешний IP "как есть" (в том ns, откуда запустили --check) и через
+# vpn. Запускается ДО переключения ns в main, поэтому первый curl честно
+# показывает адрес исходного неймспейса.
+do_check() {
+    local URL="https://api.ipify.org"
+    local CURL=(curl -fsS -4 --max-time 15 "$URL")
+
+    echo "== внешний IP в текущем ns (без vpn) =="
+    if "${CURL[@]}"; then echo; else echo "  (не удалось получить)"; fi
+
+    echo "== внешний IP через vpn =="
+    if "$0" "${CURL[@]}"; then echo; else echo "  (не удалось получить)"; fi
+}
+
+# --------------------------- выполнение команды ------------------------------
+# Внутри ns: окружение и cwd уже унаследованы — просто запускаем команду.
+run_here() {
+    [ $# -ge 1 ] || die "нужна команда"
+    exec "$@"
+}
+
+# На хосте: довести окружение до готовности и войти в ns под нужным юзером.
+run_via_ns() {
+    [ $# -ge 1 ] || { echo "Использование: vpn <команда> [аргументы...]" >&2; exit 1; }
+
+    if is_root; then ensure_setup; else sudo "$0" --ensure || exit 1; fi
+
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        USER_TO_RUN="$SUDO_USER"
+    else
+        USER_TO_RUN="${USER:-$(id -un)}"
+    fi
+
+    # Захватываем окружение (исключаем системные переменные, которые нельзя
+    # переопределять). Флага -i у внутреннего sudo нет: окружение восстанавливаем
+    # руками через eval.
+    SAVED_ENV=$(export -p | grep -vE ' (UID|EUID|PPID|SUDO_.*|BASH_.*)=')
+
+    sudo ip netns exec "$NS_NAME" sudo -u "$USER_TO_RUN" bash -c '
+        eval "$1"
+        cd "$2"
+        shift 2
+        "$@"
+    ' -- "$SAVED_ENV" "$PWD" "$@"
+}
+
+# Переключиться в основной (хостовый) сетевой неймспейс, сохранив окружение,
+# рабочий каталог и исходного пользователя (через SUDO_USER, который выставит sudo).
+# Нужно, когда vpn запущен из чужого ns (например, 'vpn2' из setup/vpn-via-socks):
+# вся настройка (перенос $IFACE, маршруты) делается из основного ns хоста.
+switch_to_host() {
+    local saved_env
+    saved_env=$(export -p | grep -vE ' (UID|EUID|PPID|SUDO_.*|BASH_.*)=')
+    # -m -n: входим и в mount-ns, и в net-ns PID 1. mount-ns обязателен, т.к.
+    # именованные сетевые ns — это бинд-маунты в /run/netns, и в приватном
+    # mount-ns вызывающего ссылка на vpn невалидна ("setting the network
+    # namespace vpn failed"). Заодно возвращается хостовый /etc/resolv.conf.
+    exec sudo nsenter -t 1 -m -n bash -c '
+        eval "$1"
+        cd "$2"
+        shift 2
+        exec "$@"
+    ' -- "$saved_env" "$PWD" "$0" "$@"
+}
+
+# ---------------------------------- main -------------------------------------
+
+# 0) --check обрабатываем ДО любого переключения ns: первый curl должен идти из
+#    того неймспейса, откуда вызвали.
+if [ "${1:-}" = "--check" ]; then
+    do_check
+    exit $?
 fi
 
-if [ $# -eq 0 ]; then
-    echo "Использование: vpn2 <команда> [аргументы...]" >&2
-    echo "Пример: MY_VAR=123 vpn2 bash" >&2
-    exit 1
+# 1) Уже внутри vpn-ns (в т.ч. вложенный вызов vpn vpn ...).
+#    Управляющие флаги требуют основного ns хоста (в приватном mount-ns изнутри
+#    ns ссылки /run/netns невалидны, да и настраивать надо снаружи) — уходим туда.
+#    Всё остальное выполняем прямо здесь: окружение унаследовано напрямую.
+if in_target_ns; then
+    case "${1:-}" in
+        --ensure|--clean|--status) switch_to_host "$@" ;;
+        *)                         run_here "$@" ;;
+    esac
 fi
 
-# Получаем имя пользователя
-if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-    USER_TO_RUN="$SUDO_USER"
-else
-    USER_TO_RUN="$USER"
+# 2) Запущены из другого сетевого ns (например, 'socks') — уходим в основной ns хоста.
+CUR_NS="$(ip netns identify $$ 2>/dev/null || true)"
+if [ -n "$CUR_NS" ] && [ "$CUR_NS" != "$NS_NAME" ]; then
+    switch_to_host "$@"
 fi
 
-# Захватываем окружение (исключаем системные переменные, которые нельзя переопределять)
-SAVED_ENV=$(export -p | grep -vE ' (UID|EUID|PPID|SUDO_.*|BASH_.*)=')
-
-# Убран флаг -i у внутреннего sudo, так как мы полностью восстанавливаем окружение руками
-sudo ip netns exec "$NS_NAME" sudo -u "$USER_TO_RUN" bash -c '
-    eval "$1"
-    cd "$2"
-    shift 2
-    "$@"
-' -- "$SAVED_ENV" "$PWD" "$@"
+# 3) Мы в основном ns хоста.
+case "${1:-}" in
+    --ensure) if is_root; then ensure_setup; else exec sudo "$0" --ensure; fi ;;
+    --clean)  if is_root; then do_clean;     else exec sudo "$0" --clean;  fi ;;
+    --status) do_status ;;
+    "")       echo "Использование: vpn <команда> [аргументы...] | --ensure | --clean | --status | --check" >&2; exit 1 ;;
+    *)        run_via_ns "$@" ;;
+esac

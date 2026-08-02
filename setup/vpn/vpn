@@ -12,9 +12,23 @@
 #     vpn --clean                       снести ns и вернуть интерфейс хосту
 #     vpn --status                      показать состояние
 #     vpn --check                       показать внешний IP: в текущем ns и через vpn
+#     VPN_FORCE=1 vpn --ensure          забрать $IFACE, игнорируя проверку ниже
 #
 # Скрипт сам уходит в основной ns хоста, если запущен из другого ns (например,
 # из 'vpn2' в setup/vpn-via-socks) — оборачивать в no-vpn не нужно.
+#
+# Предусловие (проверяется перед переносом $IFACE, см. host_uplink_ok):
+#   у хоста должен быть default-маршрут через устройство, отличное от $IFACE,
+#   и хотя бы один nameserver. Иначе $IFACE — единственный аплинк хоста, и его
+#   переезд в ns оставит хост без сети и DNS: NetworkManager уводит вместе с
+#   устройством активный профиль и переписывает resolv.conf пустым.
+#   Проверке предшествует ограниченное ожидание (HOST_NET_WAIT) — оно нужно лишь
+#   для раннего запуска, пока NM не дошёл до хостового интерфейса. Устойчиво
+#   сломанную конфигурацию ожиданием не вылечить, поэтому дальше идёт отказ
+#   с подсказкой, а не бесконечное ожидание.
+#   Перед самым переносом $IFACE отдаётся из-под NM (nmcli device set managed no)
+#   — runtime, до перезагрузки. Постоянный конфиг NM намеренно не трогается:
+#   схема не должна требовать правки локальных настроек машины.
 #
 # Архитектура:
 #   $IFACE переносится ЦЕЛИКОМ внутрь неймспейса (ip link set ... netns), там ему
@@ -23,16 +37,8 @@
 #   DNS для ns берётся из /etc/netns/$NS_NAME/resolv.conf: 'ip netns exec'
 #   бинд-маунтит файлы оттуда поверх /etc/ в приватном mount-ns команды.
 #
-#   Мостик до хостовой петли: у ns свой собственный lo, поэтому 127.0.0.1 внутри
-#   ns — это НЕ хостовый 127.0.0.1. Чтобы сервисы, слушающие на петле хоста,
-#   оставались доступны, поднимается veth-пара и два DNAT-правила:
-#       ns:   всё на 127.0.0.1  --DNAT-->  $VETH_HOST_IP (хостовый конец veth)
-#       хост: всё на $VETH_HOST_IP с veth --DNAT-->  127.0.0.1
-#   Порт сохраняется, работает для любого TCP/UDP. Для приложений, которые явно
-#   биндят исходящий сокет на 127.0.0.1, в ns добавлен SNAT. Хостовой стороне
-#   нужен route_localnet=1 на veth — иначе ядро дропает 127/8 не с lo.
-#   Порты, которые должны остаться ЛОКАЛЬНЫМИ внутри ns, перечисляются
-#   в KEEP_LOCAL_PORTS (сейчас на петле внутри ns никто не слушает).
+#   У ns своя собственная петля: 127.0.0.1 внутри ns — это НЕ хостовый 127.0.0.1,
+#   и хостовые сервисы, слушающие только на петле, изнутри ns недоступны.
 #
 # Скрипт идемпотентен: при повторных запусках уже созданный ns и настроенный
 # интерфейс обнаруживаются и НЕ пересоздаются. За собой ничего не чистит —
@@ -50,23 +56,10 @@ NS_GW="172.16.103.249"
 DNS1="8.8.8.8"
 DNS2="8.8.4.4"
 
-# --- мостик ns:127.0.0.1 -> хостовый 127.0.0.1 ---
-VETH_HOST="vpn-h"           # хостовый конец veth
-VETH_NS="vpn-n"             # конец veth внутри неймспейса
-VETH_HOST_IP="10.99.97.1"
-VETH_NS_IP="10.99.97.2"
-VETH_PREFIX="30"
-# Порты, которые ДОЛЖНЫ остаться локальными внутри ns (если там что-то поднимут
-# на 127.0.0.1). Пример: KEEP_LOCAL_PORTS="53 8080"
-KEEP_LOCAL_PORTS=""
-
-# Спецификации правил вынесены в массивы: одна и та же строка используется
-# и для проверки (-C), и для добавления, и для удаления в --clean.
-HOST_DNAT_SPEC=(-i "$VETH_HOST" -s "$VETH_NS_IP" -d "$VETH_HOST_IP"
-                -j DNAT --to-destination 127.0.0.1)
-NS_DNAT_SPEC=(-d 127.0.0.1/32 -j DNAT --to-destination "$VETH_HOST_IP")
-NS_SNAT_SPEC=(-o "$VETH_NS" -j SNAT --to-source "$VETH_NS_IP")
-NS_FWD_DROP_SPEC=(-o "$VETH_NS" -j DROP)
+# Сколько секунд ждать готовности хостовой сети перед тем, как забирать $IFACE.
+# Нужно только при раннем запуске (сразу после загрузки, пока NM не дошёл до
+# хостового интерфейса). Если сеть уже готова — ожидания нет вообще.
+HOST_NET_WAIT=30
 
 # --------------------------------- утилиты -----------------------------------
 log() { echo "[vpn] $*" >&2; }
@@ -90,7 +83,6 @@ in_target_ns() {
 ns_usable() { ip netns exec "$NS_NAME" true 2>/dev/null; }
 iface_in_ns() { ip netns exec "$NS_NAME" ip link show "$IFACE" >/dev/null 2>&1; }
 iface_on_host() { ip link show "$IFACE" >/dev/null 2>&1; }
-ns_ipt() { ip netns exec "$NS_NAME" iptables "$@"; }
 
 # Всё ли уже создано и настроено ранее (вызывать из root). Если да — пропускаем.
 is_ready() {
@@ -100,13 +92,107 @@ is_ready() {
         | grep -qw "$NS_IP/$NS_PREFIX" || return 1
     ip netns exec "$NS_NAME" ip route show default 2>/dev/null \
         | grep -qw "$NS_GW" || return 1
-    # мостик до хостовой петли
-    ip link show "$VETH_HOST" >/dev/null 2>&1 || return 1
-    ip netns exec "$NS_NAME" ip link show "$VETH_NS" >/dev/null 2>&1 || return 1
-    iptables -t nat -C PREROUTING "${HOST_DNAT_SPEC[@]}" 2>/dev/null || return 1
-    ns_ipt -t nat -C OUTPUT "${NS_DNAT_SPEC[@]}" 2>/dev/null || return 1
-    ns_ipt -t nat -C POSTROUTING "${NS_SNAT_SPEC[@]}" 2>/dev/null || return 1
     return 0
+}
+
+# ---------------------- предусловия хостовой сети ----------------------------
+# $IFACE уезжает с хоста целиком. Если хостовый аплинк держится на нём же, хост
+# останется без маршрута и без DNS (NetworkManager перепишет resolv.conf пустым,
+# потому что вместе с устройством уходит и активный профиль). Проверяем это ДО
+# переноса — чинить постфактум некому: сети уже нет.
+
+# Устройства, через которые у хоста есть default-маршрут (по одному в строке).
+default_route_devs() {
+    ip -4 route show default 2>/dev/null \
+        | awk '{for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}'
+}
+
+# То же одной строкой, для вывода человеку.
+default_route_devs_str() {
+    local devs
+    devs=$(default_route_devs | tr '\n' ' ')
+    devs=${devs% }
+    printf '%s' "${devs:-(нет)}"
+}
+
+# Сколько nameserver-строк в хостовом resolv.conf. Отдельная функция, потому что
+# 'grep -c' печатает 0 и ПРИ ЭТОМ выходит с кодом 1: наивный '|| echo 0' выдаёт
+# два нуля. Фолбэк нужен лишь на отсутствие файла — там вывод пустой.
+host_ns_count() {
+    local n
+    n=$(grep -cE '^[[:space:]]*nameserver' /etc/resolv.conf 2>/dev/null)
+    printf '%s' "${n:-0}"
+}
+
+# Аплинк хоста НЕ зависит от $IFACE: есть default через другое устройство и есть
+# хотя бы один nameserver.
+host_uplink_ok() {
+    default_route_devs | grep -qvx "$IFACE" || return 1
+    grep -qE '^[[:space:]]*nameserver[[:space:]]+[^[:space:]]' \
+        /etc/resolv.conf 2>/dev/null
+}
+
+# Числовое состояние устройства в NM (10 = unmanaged, 100 = activated).
+# LC_ALL=C — текстовые статусы локализованы, по ним матчить нельзя.
+nm_dev_state() {
+    LC_ALL=C nmcli -t -f GENERAL.STATE device show "$1" 2>/dev/null \
+        | sed -n 's/^GENERAL\.STATE:\([0-9]\{1,\}\).*/\1/p'
+}
+
+# Ограниченное ожидание готовности хостовой сети. Помогает ровно в одном случае:
+# ранний запуск, когда NM ещё не закончил DHCP на хостовом интерфейсе. Устойчиво
+# сломанную конфигурацию ожиданием не вылечить — для неё ниже отказ.
+wait_for_host_net() {
+    host_uplink_ok && return 0
+    log "жду готовности хостовой сети (до ${HOST_NET_WAIT}s)"
+    command -v nm-online >/dev/null 2>&1 \
+        && nm-online -s -q -t "$HOST_NET_WAIT" >/dev/null 2>&1
+    # nm-online отпускает по завершении старта NM, маршрут и resolv.conf могут
+    # появиться на доли секунды позже — дожимаем опросом.
+    local deadline=$((SECONDS + HOST_NET_WAIT))
+    while ! host_uplink_ok && [ "$SECONDS" -lt "$deadline" ]; do
+        sleep 0.5
+    done
+    host_uplink_ok
+}
+
+# Диагностика для отказа: что именно не так и как чинить.
+host_uplink_hint() {
+    cat <<EOF
+хостовая сеть держится на $IFACE — переносить его в ns нельзя, хост
+       останется без маршрута и DNS.
+         default-маршрут через: $(default_route_devs_str)
+         nameserver в /etc/resolv.conf: $(host_ns_count)
+       Ожидание тут не поможет — состояние устойчивое. Подними хостовый
+       интерфейс отдельно:
+         nmcli device status              # найти хостовый интерфейс
+         nmcli device connect <iface>     # поднять его
+       Частая причина: единственный профиль NetworkManager не привязан к
+       интерфейсу и приземлился на $IFACE. Лечится привязкой профиля:
+         nmcli connection modify <профиль> connection.interface-name <iface>
+       Сознательно забрать $IFACE несмотря на проверку: VPN_FORCE=1 vpn --ensure
+EOF
+}
+
+# Отдать $IFACE из-под NetworkManager перед переносом: иначе NM держит на нём
+# DHCP-транзакцию и лезет настраивать интерфейс параллельно с 'ip link set netns'.
+# Настройка runtime-only (сбрасывается при перезагрузке) — постоянный конфиг NM
+# намеренно не трогаем, чтобы схема не требовала правки локальных настроек.
+release_from_nm() {
+    command -v nmcli >/dev/null 2>&1 || return 0
+    local state
+    state=$(nm_dev_state "$IFACE")
+    [ -z "$state" ] && return 0          # NM про интерфейс не знает
+    [ "$state" = "10" ] && return 0      # уже unmanaged
+    log "убираю $IFACE из-под NetworkManager (runtime, до перезагрузки)"
+    nmcli device set "$IFACE" managed no >/dev/null 2>&1 || return 0
+    # NM гасит соединение асинхронно; дожидаемся, иначе он успеет дёрнуть
+    # интерфейс уже после переноса.
+    local deadline=$((SECONDS + 5))
+    while [ "$(nm_dev_state "$IFACE")" != "10" ] && [ "$SECONDS" -lt "$deadline" ]
+    do
+        sleep 0.3
+    done
 }
 
 # ------------------------- идемпотентная настройка ---------------------------
@@ -135,9 +221,15 @@ ensure_setup() {
         ip netns add "$NS_NAME" || die "не удалось создать ns $NS_NAME"
     fi
 
-    # 2. физический интерфейс: переносим внутрь ns, если он ещё на хосте
+    # 2. физический интерфейс: переносим внутрь ns, если он ещё на хосте.
+    #    Проверка предусловия — только здесь: если $IFACE уже в ns, забирать
+    #    нечего и хостовой сети ничто не угрожает.
     if ! iface_in_ns; then
         iface_on_host || die "интерфейс $IFACE не найден ни на хосте, ни в ns $NS_NAME"
+        if [ "${VPN_FORCE:-}" != "1" ]; then
+            wait_for_host_net || die "$(host_uplink_hint)"
+        fi
+        release_from_nm
         log "Переношу $IFACE в ns $NS_NAME"
         ip link set "$IFACE" netns "$NS_NAME" \
             || die "не удалось перенести $IFACE в ns (интерфейс занят NetworkManager?)"
@@ -156,68 +248,7 @@ ensure_setup() {
     printf 'nameserver %s\nnameserver %s\n' "$DNS1" "$DNS2" \
         > "/etc/netns/$NS_NAME/resolv.conf"
 
-    # 5. veth-пара для мостика до хостовой петли (создаём, только если нет ни одного конца)
-    if ! ip link show "$VETH_HOST" >/dev/null 2>&1 \
-        && ! ip netns exec "$NS_NAME" ip link show "$VETH_NS" >/dev/null 2>&1; then
-        log "Создаю veth $VETH_HOST <-> $VETH_NS"
-        ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
-    fi
-    # перенести ns-конец внутрь, если он ещё болтается на хосте
-    if ip link show "$VETH_NS" >/dev/null 2>&1; then
-        ip link set "$VETH_NS" netns "$NS_NAME"
-    fi
-
-    # 6. хостовый конец + разрешение маршрутизации в loopback.
-    #    route_localnet ставим ТОЛЬКО на этот интерфейс, а не в conf/all —
-    #    иначе петля хоста становится доступна отовсюду.
-    ip addr replace "$VETH_HOST_IP/$VETH_PREFIX" dev "$VETH_HOST"
-    ip link set "$VETH_HOST" up
-    echo 1 > "/proc/sys/net/ipv4/conf/$VETH_HOST/route_localnet"
-
-    # 7. ns-конец (route_localnet нужен и здесь: обратный пакет после un-SNAT
-    #    получает dst=127.0.0.1 на не-lo интерфейсе)
-    ip netns exec "$NS_NAME" ip addr replace "$VETH_NS_IP/$VETH_PREFIX" dev "$VETH_NS"
-    ip netns exec "$NS_NAME" ip link set "$VETH_NS" up
-    ip netns exec "$NS_NAME" sh -c \
-        "echo 1 > /proc/sys/net/ipv4/conf/$VETH_NS/route_localnet"
-
-    # 8. правила. ХОСТ: пришедшее с veth на $VETH_HOST_IP -> реальный 127.0.0.1
-    #    (порт сохраняется). Ограничено -i/-s, чтобы петлю не открыть шире.
-    iptables -t nat -C PREROUTING "${HOST_DNAT_SPEC[@]}" 2>/dev/null \
-        || iptables -t nat -I PREROUTING 1 "${HOST_DNAT_SPEC[@]}"
-
-    #    NS: исключения (порты, которые слушают внутри ns) — строго ПЕРЕД общим
-    #    правилом, поэтому вставляем в начало цепочки.
-    for p in $KEEP_LOCAL_PORTS; do
-        for proto in tcp udp; do
-            ns_ipt -t nat -C OUTPUT -d 127.0.0.1/32 -p "$proto" --dport "$p" \
-                -j RETURN 2>/dev/null \
-            || ns_ipt -t nat -I OUTPUT 1 -d 127.0.0.1/32 -p "$proto" --dport "$p" \
-                -j RETURN
-        done
-    done
-
-    #    NS: всё остальное на 127.0.0.1 -> хостовый конец veth
-    ns_ipt -t nat -C OUTPUT "${NS_DNAT_SPEC[@]}" 2>/dev/null \
-        || ns_ipt -t nat -A OUTPUT "${NS_DNAT_SPEC[@]}"
-
-    #    NS: приложение могло явно забиндить исходящий сокет на 127.0.0.1 —
-    #    переписываем источник, иначе пакет уйдёт с невалидным для veth адресом
-    ns_ipt -t nat -C POSTROUTING "${NS_SNAT_SPEC[@]}" 2>/dev/null \
-        || ns_ipt -t nat -A POSTROUTING "${NS_SNAT_SPEC[@]}"
-
-    #    NS: транзит в мостик запрещён — чтобы соседи по VPN-сети не смогли
-    #    достучаться до хостовой петли через ns, если кто-то включит ip_forward
-    ns_ipt -C FORWARD "${NS_FWD_DROP_SPEC[@]}" 2>/dev/null \
-        || ns_ipt -I FORWARD 1 "${NS_FWD_DROP_SPEC[@]}"
-
-    # Мостик только IPv4: ядро не доставляет пакеты на ::1, пришедшие не с lo,
-    # и аналога route_localnet для IPv6 нет — хостовую петлю по ::1 не пробросить.
     # /etc/hosts намеренно не трогаем: в ns виден настоящий хостовый файл.
-    # Вычищать из него '::1 localhost' бесполезно (на AF_INET6-запрос всё равно
-    # ответит nss_myhostname), а копия молча расходилась бы с оригиналом.
-    # Клиенты справляются сами: на ::1 внутри ns прилетает мгновенный
-    # ECONNREFUSED от локального lo, и они переходят на 127.0.0.1.
     # Нужны ns-специфичные записи — положи /etc/netns/$NS_NAME/hosts руками.
 
     is_ready || die "настройка не завершилась, смотри 'vpn --status'"
@@ -228,12 +259,6 @@ do_clean() {
     is_root || die "do_clean должен выполняться от root"
     local PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
     log "Сношу ns $NS_NAME"
-    # хостовое DNAT-правило мостика (все дубликаты, если вдруг есть).
-    # Правила внутри ns уезжают вместе с ним, отдельно чистить не нужно.
-    while iptables -t nat -C PREROUTING "${HOST_DNAT_SPEC[@]}" 2>/dev/null; do
-        iptables -t nat -D PREROUTING "${HOST_DNAT_SPEC[@]}" 2>/dev/null || break
-    done
-    ip link del "$VETH_HOST" 2>/dev/null || true   # уносит и $VETH_NS из ns
     # удаление ns автоматически возвращает физический интерфейс в основной ns
     # (без адресов и в состоянии DOWN — хостовая настройка, если она была,
     # восстанавливается средствами NetworkManager/ifupdown).
@@ -249,6 +274,14 @@ do_clean() {
 
 # --------------------------------- статус ------------------------------------
 do_status() {
+    echo "== хостовый аплинк =="
+    echo "  default через: $(default_route_devs_str)"
+    echo "  nameserver на хосте: $(host_ns_count)"
+    if host_uplink_ok; then
+        echo "  забирать $IFACE в ns безопасно"
+    else
+        echo "  ВНИМАНИЕ: хостовая сеть зависит от $IFACE — перенос оставит хост без сети"
+    fi
     echo "== неймспейс =="; ip netns list 2>/dev/null | grep -w "$NS_NAME" || echo "  нет"
     echo "== $IFACE =="
     if sudo ip netns exec "$NS_NAME" ip -br addr show dev "$IFACE" 2>/dev/null; then :
@@ -258,13 +291,6 @@ do_status() {
     sudo ip netns exec "$NS_NAME" ip route 2>/dev/null || echo "  ns недоступен"
     echo "== DNS в ns =="
     cat "/etc/netns/$NS_NAME/resolv.conf" 2>/dev/null || echo "  нет resolv.conf"
-    echo "== мостик 127.0.0.1 =="
-    ip -br addr show dev "$VETH_HOST" 2>/dev/null || echo "  $VETH_HOST не поднят"
-    sudo ip netns exec "$NS_NAME" ip -br addr show dev "$VETH_NS" 2>/dev/null \
-        || echo "  $VETH_NS не поднят"
-    echo "  route_localnet($VETH_HOST): $(cat "/proc/sys/net/ipv4/conf/$VETH_HOST/route_localnet" 2>/dev/null || echo '?')"
-    sudo iptables -t nat -S PREROUTING 2>/dev/null | grep -- "$VETH_HOST_IP" || echo "  нет DNAT на хосте"
-    sudo ip netns exec "$NS_NAME" iptables -t nat -S OUTPUT 2>/dev/null | grep -- '127.0.0.1' || echo "  нет DNAT в ns"
 }
 
 # --------------------------------- проверка ----------------------------------

@@ -13,6 +13,7 @@
 #     vpn --status                      показать состояние
 #     vpn --check                       показать внешний IP: в текущем ns и через vpn
 #     VPN_FORCE=1 vpn --ensure          забрать $IFACE, игнорируя проверку ниже
+#     VPN_IDE_LOCK_DIR=... vpn ...      другой каталог lock-файлов IDE
 #
 # Скрипт сам уходит в основной ns хоста, если запущен из другого ns (например,
 # из 'vpn2' в setup/vpn-via-socks) — оборачивать в no-vpn не нужно.
@@ -40,6 +41,19 @@
 #   У ns своя собственная петля: 127.0.0.1 внутри ns — это НЕ хостовый 127.0.0.1,
 #   и хостовые сервисы, слушающие только на петле, изнутри ns недоступны.
 #
+#   Мостик до хостовой петли для IDE: JetBrains/VSCode-плагин Claude Code кладёт
+#   в $IDE_LOCK_DIR файл вида <порт>.lock на каждый запущенный IDE и слушает этот
+#   порт на хостовом 127.0.0.1. Пробрасываются ТОЛЬКО эти TCP-порты — через
+#   veth-пару и две цепочки DNAT (порт сохраняется):
+#       ns:   127.0.0.1:<порт>       --DNAT-->  $VETH_HOST_IP:<порт>
+#       хост: $VETH_HOST_IP:<порт>   --DNAT-->  127.0.0.1:<порт>
+#   Приложение может забиндить исходящий сокет на 127.0.0.1, поэтому в ns есть
+#   ещё SNAT на адрес своего конца veth. Хостовой стороне нужен route_localnet=1
+#   на veth — иначе ядро дропает 127/8, пришедшее не с lo.
+#   Осознанно НЕ пробрасывается вся петля целиком: хостовый 127.0.0.1 — это
+#   доверенная зона (там же сидят и отладочные, и служебные сокеты), и открывать
+#   её в ns ради пары портов IDE незачем.
+#
 # Скрипт идемпотентен: при повторных запусках уже созданный ns и настроенный
 # интерфейс обнаруживаются и НЕ пересоздаются. За собой ничего не чистит —
 # для сноса есть --clean.
@@ -55,6 +69,28 @@ NS_GW="172.16.103.249"
 
 DNS1="8.8.8.8"
 DNS2="8.8.4.4"
+
+# --- мостик до хостовой петли для портов IDE ---
+VETH_HOST="vpn-h"           # хостовый конец veth
+VETH_NS="vpn-n"             # конец veth внутри неймспейса
+VETH_HOST_IP="10.99.97.1"
+VETH_NS_IP="10.99.97.2"
+VETH_PREFIX="30"
+# Цепочка (одноимённая на хосте и в ns), куда складываются правила на каждый
+# найденный порт. Отдельная цепочка нужна ровно затем, чтобы пересинхронизация
+# была флешем: набор lock-файлов меняется при каждом перезапуске IDE, и точечно
+# доудалять исчезнувшие порты пришлось бы разбором вывода iptables.
+IDE_CHAIN="VPN_IDE"
+# Каталог с lock-файлами IDE. Ищется у пользователя, который вызвал vpn, а не у
+# root: под sudo $HOME — это /root. Переопределяется через VPN_IDE_LOCK_DIR.
+IDE_LOCK_DIR="${VPN_IDE_LOCK_DIR:-}"
+
+# Спецификации правил вынесены в переменные: одна и та же строка используется
+# и для проверки (-C), и для добавления, и для удаления в --clean.
+HOST_JUMP_SPEC=(-i "$VETH_HOST" -s "$VETH_NS_IP" -d "$VETH_HOST_IP" -j "$IDE_CHAIN")
+NS_JUMP_SPEC=(-d 127.0.0.1/32 -p tcp -j "$IDE_CHAIN")
+NS_SNAT_SPEC=(-o "$VETH_NS" -j SNAT --to-source "$VETH_NS_IP")
+NS_FWD_DROP_SPEC=(-o "$VETH_NS" -j DROP)
 
 # Сколько секунд ждать готовности хостовой сети перед тем, как забирать $IFACE.
 # Нужно только при раннем запуске (сразу после загрузки, пока NM не дошёл до
@@ -83,8 +119,20 @@ in_target_ns() {
 ns_usable() { ip netns exec "$NS_NAME" true 2>/dev/null; }
 iface_in_ns() { ip netns exec "$NS_NAME" ip link show "$IFACE" >/dev/null 2>&1; }
 iface_on_host() { ip link show "$IFACE" >/dev/null 2>&1; }
+ns_ipt() { ip netns exec "$NS_NAME" iptables "$@"; }
+veth_host_up() { ip link show "$VETH_HOST" >/dev/null 2>&1; }
+veth_ns_up() { ip netns exec "$NS_NAME" ip link show "$VETH_NS" >/dev/null 2>&1; }
+
+# Добавить правило, если его ещё нет: "$1" — команда (iptables/ns_ipt),
+# "$2" — куда вставлять (-I/-A), "$3" — цепочка, дальше спецификация.
+ensure_rule() {
+    local cmd="$1" op="$2" chain="$3"; shift 3
+    "$cmd" -t nat -C "$chain" "$@" 2>/dev/null || "$cmd" -t nat "$op" "$chain" "$@"
+}
 
 # Всё ли уже создано и настроено ранее (вызывать из root). Если да — пропускаем.
+# Про конкретные проброшенные порты тут ничего не проверяется: они живут в
+# $IDE_CHAIN и пересинхронизируются отдельно на каждом запуске (см. sync_ide_ports).
 is_ready() {
     ns_usable || return 1
     iface_in_ns || return 1
@@ -92,7 +140,61 @@ is_ready() {
         | grep -qw "$NS_IP/$NS_PREFIX" || return 1
     ip netns exec "$NS_NAME" ip route show default 2>/dev/null \
         | grep -qw "$NS_GW" || return 1
+    # мостик до хостовой петли
+    veth_host_up || return 1
+    veth_ns_up || return 1
+    iptables -t nat -n -L "$IDE_CHAIN" >/dev/null 2>&1 || return 1
+    ns_ipt -t nat -n -L "$IDE_CHAIN" >/dev/null 2>&1 || return 1
+    iptables -t nat -C PREROUTING "${HOST_JUMP_SPEC[@]}" 2>/dev/null || return 1
+    ns_ipt -t nat -C OUTPUT "${NS_JUMP_SPEC[@]}" 2>/dev/null || return 1
+    ns_ipt -t nat -C POSTROUTING "${NS_SNAT_SPEC[@]}" 2>/dev/null || return 1
     return 0
+}
+
+# ------------------------- порты IDE (lock-файлы) ----------------------------
+# Каталог lock-файлов вызвавшего пользователя. Под sudo $HOME указывает на /root,
+# поэтому домашний каталог берётся из passwd по имени исходного пользователя.
+ide_lock_dir() {
+    [ -n "$IDE_LOCK_DIR" ] && { printf '%s' "$IDE_LOCK_DIR"; return 0; }
+    local u home
+    u="${SUDO_USER:-}"
+    if [ -z "$u" ] || [ "$u" = "root" ]; then
+        u="${USER:-$(id -un)}"
+    fi
+    home=$(getent passwd "$u" 2>/dev/null | cut -d: -f6)
+    printf '%s/.claude/ide' "${home:-$HOME}"
+}
+
+# Порты из имён файлов <порт>.lock. Содержимое файла не парсится: номер порта
+# и есть имя, а json там — про workspace и токен авторизации.
+ide_ports() {
+    local dir f p
+    dir=$(ide_lock_dir)
+    [ -d "$dir" ] || return 0
+    for f in "$dir"/*.lock; do
+        [ -e "$f" ] || continue           # nullglob не включён: пустой каталог
+        p=${f##*/}; p=${p%.lock}
+        case "$p" in ''|*[!0-9]*) continue ;; esac
+        [ "$p" -ge 1 ] 2>/dev/null && [ "$p" -le 65535 ] && printf '%s\n' "$p"
+    done
+}
+
+# Переложить актуальный набор портов в $IDE_CHAIN с обеих сторон мостика.
+# Вызывается на КАЖДОМ запуске (в отличие от остальной настройки): IDE при
+# перезапуске занимает новый порт и оставляет новый lock-файл.
+sync_ide_ports() {
+    local p ports
+    ports=$(ide_ports | tr '\n' ' '); ports=${ports% }
+    iptables -t nat -F "$IDE_CHAIN"
+    ns_ipt   -t nat -F "$IDE_CHAIN"
+    for p in $ports; do
+        # ns: на хостовый конец veth; хост: с него на свою настоящую петлю
+        ns_ipt   -t nat -A "$IDE_CHAIN" -p tcp --dport "$p" \
+            -j DNAT --to-destination "$VETH_HOST_IP:$p"
+        iptables -t nat -A "$IDE_CHAIN" -p tcp --dport "$p" \
+            -j DNAT --to-destination "127.0.0.1:$p"
+    done
+    log "порты IDE из $(ide_lock_dir): ${ports:-(нет)}"
 }
 
 # ---------------------- предусловия хостовой сети ----------------------------
@@ -203,7 +305,8 @@ ensure_setup() {
     local PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
 
     if is_ready; then
-        return 0   # всё уже создано ранее
+        sync_ide_ports   # всё создано ранее, но набор портов IDE мог смениться
+        return 0
     fi
 
     # 1. неймспейс. Проверяем РАБОТОСПОСОБНОСТЬ (setns), а не просто наличие имени:
@@ -248,10 +351,56 @@ ensure_setup() {
     printf 'nameserver %s\nnameserver %s\n' "$DNS1" "$DNS2" \
         > "/etc/netns/$NS_NAME/resolv.conf"
 
+    # 5. veth-пара мостика (создаём, только если нет ни одного конца)
+    if ! veth_host_up && ! veth_ns_up; then
+        log "Создаю veth $VETH_HOST <-> $VETH_NS"
+        ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
+    fi
+    # ns-конец мог остаться на хосте (например, после сбоя на прошлом запуске)
+    if ip link show "$VETH_NS" >/dev/null 2>&1; then
+        ip link set "$VETH_NS" netns "$NS_NAME"
+    fi
+
+    # 6. хостовый конец. route_localnet ставим ТОЛЬКО на этот интерфейс, а не в
+    #    conf/all — иначе петля хоста становится маршрутизируемой отовсюду.
+    ip addr replace "$VETH_HOST_IP/$VETH_PREFIX" dev "$VETH_HOST"
+    ip link set "$VETH_HOST" up
+    echo 1 > "/proc/sys/net/ipv4/conf/$VETH_HOST/route_localnet"
+
+    # 7. ns-конец (route_localnet нужен и здесь: обратный пакет после un-SNAT
+    #    получает dst=127.0.0.1 на не-lo интерфейсе)
+    ip netns exec "$NS_NAME" ip addr replace "$VETH_NS_IP/$VETH_PREFIX" dev "$VETH_NS"
+    ip netns exec "$NS_NAME" ip link set "$VETH_NS" up
+    ip netns exec "$NS_NAME" sh -c \
+        "echo 1 > /proc/sys/net/ipv4/conf/$VETH_NS/route_localnet"
+
+    # 8. цепочки под порты IDE и переходы в них. Сами правила наполняет
+    #    sync_ide_ports ниже. Хостовый переход вставляем первым: в PREROUTING
+    #    уже может сидеть DOCKER, и до него дело доходить не должно.
+    iptables -t nat -N "$IDE_CHAIN" 2>/dev/null || true
+    ns_ipt   -t nat -N "$IDE_CHAIN" 2>/dev/null || true
+    ensure_rule iptables -I PREROUTING "${HOST_JUMP_SPEC[@]}"
+    ensure_rule ns_ipt   -A OUTPUT     "${NS_JUMP_SPEC[@]}"
+
+    #    NS: приложение могло явно забиндить исходящий сокет на 127.0.0.1 —
+    #    переписываем источник, иначе пакет уйдёт с невалидным для veth адресом
+    ensure_rule ns_ipt -A POSTROUTING "${NS_SNAT_SPEC[@]}"
+
+    #    NS: транзит в мостик запрещён — чтобы соседи по VPN-сети не смогли
+    #    достучаться до хостовой петли через ns, если кто-то включит ip_forward
+    ns_ipt -C FORWARD "${NS_FWD_DROP_SPEC[@]}" 2>/dev/null \
+        || ns_ipt -I FORWARD 1 "${NS_FWD_DROP_SPEC[@]}"
+
+    # Мостик только IPv4: ядро не доставляет пакеты на ::1, пришедшие не с lo,
+    # и аналога route_localnet для IPv6 нет — хостовую петлю по ::1 не пробросить.
+    # Клиентам это не мешает: на ::1 внутри ns прилетает мгновенный ECONNREFUSED
+    # от локальной петли ns, после чего они переходят на 127.0.0.1.
+
     # /etc/hosts намеренно не трогаем: в ns виден настоящий хостовый файл.
     # Нужны ns-специфичные записи — положи /etc/netns/$NS_NAME/hosts руками.
 
     is_ready || die "настройка не завершилась, смотри 'vpn --status'"
+    sync_ide_ports
 }
 
 # --------------------------------- снос --------------------------------------
@@ -259,6 +408,19 @@ do_clean() {
     is_root || die "do_clean должен выполняться от root"
     local PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
     log "Сношу ns $NS_NAME"
+    # Хостовая часть мостика. Снимаем ВСЕ правила PREROUTING, ссылающиеся на
+    # хостовый конец veth: кроме нашего перехода туда могли попасть правила от
+    # прежних версий скрипта. Правила внутри ns уезжают вместе с ним.
+    local rule
+    while read -r rule; do
+        [ -n "$rule" ] || continue
+        # shellcheck disable=SC2086  # спецификация правила должна разбиться на слова
+        iptables -t nat -D PREROUTING ${rule#-A PREROUTING } 2>/dev/null || true
+    done < <(iptables -t nat -S PREROUTING 2>/dev/null \
+                | grep -e "$VETH_HOST_IP" -e " $VETH_HOST ")
+    iptables -t nat -F "$IDE_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$IDE_CHAIN" 2>/dev/null || true
+    ip link del "$VETH_HOST" 2>/dev/null || true   # уносит и $VETH_NS из ns
     # удаление ns автоматически возвращает физический интерфейс в основной ns
     # (без адресов и в состоянии DOWN — хостовая настройка, если она была,
     # восстанавливается средствами NetworkManager/ifupdown).
@@ -291,6 +453,19 @@ do_status() {
     sudo ip netns exec "$NS_NAME" ip route 2>/dev/null || echo "  ns недоступен"
     echo "== DNS в ns =="
     cat "/etc/netns/$NS_NAME/resolv.conf" 2>/dev/null || echo "  нет resolv.conf"
+    echo "== мостик к петле хоста =="
+    ip -br addr show dev "$VETH_HOST" 2>/dev/null || echo "  $VETH_HOST не поднят"
+    sudo ip netns exec "$NS_NAME" ip -br addr show dev "$VETH_NS" 2>/dev/null \
+        || echo "  $VETH_NS не поднят"
+    echo "  route_localnet($VETH_HOST): $(cat "/proc/sys/net/ipv4/conf/$VETH_HOST/route_localnet" 2>/dev/null || echo '?')"
+    echo "== порты IDE ($(ide_lock_dir)) =="
+    echo "  lock-файлы: $(ide_ports | tr '\n' ' ')"
+    echo "  правила в ns:"
+    sudo ip netns exec "$NS_NAME" iptables -t nat -S "$IDE_CHAIN" 2>/dev/null \
+        | sed -n 's/^-A /    /p' | grep . || echo "    нет"
+    echo "  правила на хосте:"
+    sudo iptables -t nat -S "$IDE_CHAIN" 2>/dev/null \
+        | sed -n 's/^-A /    /p' | grep . || echo "    нет"
 }
 
 # --------------------------------- проверка ----------------------------------

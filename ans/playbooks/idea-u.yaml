@@ -21,7 +21,7 @@
 
     - name: Extract version from URL
       set_fact:
-        ide_version: '{{ ide_linux_url | regex_replace("^.*/idea(?:IU)?-(.+)\\.tar\\.gz$", "\\1") }}'
+        ide_version: "{{ ide_linux_url | regex_replace('^.*/idea(?:IU)?-(.+)\\.tar\\.gz$', '\\1') }}"
       delegate_to: localhost
 
     - name: Detected latest ide

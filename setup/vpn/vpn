@@ -14,6 +14,7 @@
 #     vpn --check                       показать внешний IP: в текущем ns и через vpn
 #     VPN_FORCE=1 vpn --ensure          забрать $IFACE, игнорируя проверку ниже
 #     VPN_IDE_LOCK_DIR=... vpn ...      другой каталог lock-файлов IDE
+#     VPN_PORTS_FILE=... vpn ...        другой файл со списком портов (см. ниже)
 #
 # Скрипт сам уходит в основной ns хоста, если запущен из другого ns (например,
 # из 'vpn2' в setup/vpn-via-socks) — оборачивать в no-vpn не нужно.
@@ -41,10 +42,12 @@
 #   У ns своя собственная петля: 127.0.0.1 внутри ns — это НЕ хостовый 127.0.0.1,
 #   и хостовые сервисы, слушающие только на петле, изнутри ns недоступны.
 #
-#   Мостик до хостовой петли для IDE: JetBrains/VSCode-плагин Claude Code кладёт
+#   Мостик до хостовой петли: JetBrains/VSCode-плагин Claude Code кладёт
 #   в $IDE_LOCK_DIR файл вида <порт>.lock на каждый запущенный IDE и слушает этот
-#   порт на хостовом 127.0.0.1. Пробрасываются ТОЛЬКО эти TCP-порты — через
-#   veth-пару и две цепочки DNAT (порт сохраняется):
+#   порт на хостовом 127.0.0.1. Кроме портов IDE пробрасываются порты, перечисленные
+#   в $PORTS_FILE (по умолчанию ~/.no-vpn-ports вызвавшего пользователя); нет
+#   файла — нет и лишних портов, поведение как раньше. Пробрасываются ТОЛЬКО эти
+#   TCP-порты — через veth-пару и две цепочки DNAT (порт сохраняется):
 #       ns:   127.0.0.1:<порт>       --DNAT-->  $VETH_HOST_IP:<порт>
 #       хост: $VETH_HOST_IP:<порт>   --DNAT-->  127.0.0.1:<порт>
 #   Приложение может забиндить исходящий сокет на 127.0.0.1, поэтому в ns есть
@@ -52,7 +55,7 @@
 #   на veth — иначе ядро дропает 127/8, пришедшее не с lo.
 #   Осознанно НЕ пробрасывается вся петля целиком: хостовый 127.0.0.1 — это
 #   доверенная зона (там же сидят и отладочные, и служебные сокеты), и открывать
-#   её в ns ради пары портов IDE незачем.
+#   её в ns ради пары портов незачем.
 #
 # Скрипт идемпотентен: при повторных запусках уже созданный ns и настроенный
 # интерфейс обнаруживаются и НЕ пересоздаются. За собой ничего не чистит —
@@ -70,7 +73,7 @@ NS_GW="172.16.103.249"
 DNS1="8.8.8.8"
 DNS2="8.8.4.4"
 
-# --- мостик до хостовой петли для портов IDE ---
+# --- мостик до хостовой петли для проброшенных портов ---
 VETH_HOST="vpn-h"           # хостовый конец veth
 VETH_NS="vpn-n"             # конец veth внутри неймспейса
 VETH_HOST_IP="10.99.97.1"
@@ -80,15 +83,19 @@ VETH_PREFIX="30"
 # найденный порт. Отдельная цепочка нужна ровно затем, чтобы пересинхронизация
 # была флешем: набор lock-файлов меняется при каждом перезапуске IDE, и точечно
 # доудалять исчезнувшие порты пришлось бы разбором вывода iptables.
-IDE_CHAIN="VPN_IDE"
-# Каталог с lock-файлами IDE. Ищется у пользователя, который вызвал vpn, а не у
-# root: под sudo $HOME — это /root. Переопределяется через VPN_IDE_LOCK_DIR.
+# Имя историческое (сначала пробрасывались только порты IDE) — оставлено прежним,
+# чтобы --clean снимал цепочку, созданную старой версией скрипта.
+PORT_CHAIN="VPN_IDE"
+# Каталог с lock-файлами IDE и файл со списком дополнительных портов. Ищутся у
+# пользователя, который вызвал vpn, а не у root: под sudo $HOME — это /root.
+# Переопределяются через VPN_IDE_LOCK_DIR / VPN_PORTS_FILE.
 IDE_LOCK_DIR="${VPN_IDE_LOCK_DIR:-}"
+PORTS_FILE="${VPN_PORTS_FILE:-}"
 
 # Спецификации правил вынесены в переменные: одна и та же строка используется
 # и для проверки (-C), и для добавления, и для удаления в --clean.
-HOST_JUMP_SPEC=(-i "$VETH_HOST" -s "$VETH_NS_IP" -d "$VETH_HOST_IP" -j "$IDE_CHAIN")
-NS_JUMP_SPEC=(-d 127.0.0.1/32 -p tcp -j "$IDE_CHAIN")
+HOST_JUMP_SPEC=(-i "$VETH_HOST" -s "$VETH_NS_IP" -d "$VETH_HOST_IP" -j "$PORT_CHAIN")
+NS_JUMP_SPEC=(-d 127.0.0.1/32 -p tcp -j "$PORT_CHAIN")
 NS_SNAT_SPEC=(-o "$VETH_NS" -j SNAT --to-source "$VETH_NS_IP")
 NS_FWD_DROP_SPEC=(-o "$VETH_NS" -j DROP)
 
@@ -132,7 +139,7 @@ ensure_rule() {
 
 # Всё ли уже создано и настроено ранее (вызывать из root). Если да — пропускаем.
 # Про конкретные проброшенные порты тут ничего не проверяется: они живут в
-# $IDE_CHAIN и пересинхронизируются отдельно на каждом запуске (см. sync_ide_ports).
+# $PORT_CHAIN и пересинхронизируются отдельно на каждом запуске (см. sync_ports).
 is_ready() {
     ns_usable || return 1
     iface_in_ns || return 1
@@ -143,26 +150,45 @@ is_ready() {
     # мостик до хостовой петли
     veth_host_up || return 1
     veth_ns_up || return 1
-    iptables -t nat -n -L "$IDE_CHAIN" >/dev/null 2>&1 || return 1
-    ns_ipt -t nat -n -L "$IDE_CHAIN" >/dev/null 2>&1 || return 1
+    iptables -t nat -n -L "$PORT_CHAIN" >/dev/null 2>&1 || return 1
+    ns_ipt -t nat -n -L "$PORT_CHAIN" >/dev/null 2>&1 || return 1
     iptables -t nat -C PREROUTING "${HOST_JUMP_SPEC[@]}" 2>/dev/null || return 1
     ns_ipt -t nat -C OUTPUT "${NS_JUMP_SPEC[@]}" 2>/dev/null || return 1
     ns_ipt -t nat -C POSTROUTING "${NS_SNAT_SPEC[@]}" 2>/dev/null || return 1
     return 0
 }
 
-# ------------------------- порты IDE (lock-файлы) ----------------------------
-# Каталог lock-файлов вызвавшего пользователя. Под sudo $HOME указывает на /root,
-# поэтому домашний каталог берётся из passwd по имени исходного пользователя.
-ide_lock_dir() {
-    [ -n "$IDE_LOCK_DIR" ] && { printf '%s' "$IDE_LOCK_DIR"; return 0; }
+# --------------------------- пробрасываемые порты ----------------------------
+# Домашний каталог вызвавшего пользователя. Под sudo $HOME указывает на /root,
+# поэтому он берётся из passwd по имени исходного пользователя.
+caller_home() {
     local u home
     u="${SUDO_USER:-}"
     if [ -z "$u" ] || [ "$u" = "root" ]; then
         u="${USER:-$(id -un)}"
     fi
     home=$(getent passwd "$u" 2>/dev/null | cut -d: -f6)
-    printf '%s/.claude/ide' "${home:-$HOME}"
+    printf '%s' "${home:-$HOME}"
+}
+
+# Каталог lock-файлов IDE вызвавшего пользователя.
+ide_lock_dir() {
+    [ -n "$IDE_LOCK_DIR" ] && { printf '%s' "$IDE_LOCK_DIR"; return 0; }
+    printf '%s/.claude/ide' "$(caller_home)"
+}
+
+# Файл со списком дополнительных портов вызвавшего пользователя.
+ports_file() {
+    [ -n "$PORTS_FILE" ] && { printf '%s' "$PORTS_FILE"; return 0; }
+    printf '%s/.no-vpn-ports' "$(caller_home)"
+}
+
+# Список портов (по одному в строке) одной строкой для вывода человеку.
+fmt_ports() {
+    local s
+    s=$(printf '%s' "$1" | tr '\n' ' ')
+    s=${s% }
+    printf '%s' "${s:-(нет)}"
 }
 
 # Порты из имён файлов <порт>.lock. Содержимое файла не парсится: номер порта
@@ -179,22 +205,53 @@ ide_ports() {
     done
 }
 
-# Переложить актуальный набор портов в $IDE_CHAIN с обеих сторон мостика.
+# Порты из $(ports_file) — то, что пользователь захотел пробросить сверх IDE.
+# Формат намеренно нестрогий: номера портов, разделённые пробелами, переводами
+# строки или запятыми; всё после '#' — комментарий. Нет файла — нет и портов
+# (поведение ровно как до появления этой возможности).
+extra_ports() {
+    local file line tok
+    file=$(ports_file)
+    [ -f "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%%#*}
+        line=${line//,/ }
+        for tok in $line; do
+            case "$tok" in ''|*[!0-9]*) ;;
+                *) if [ "$tok" -ge 1 ] 2>/dev/null && [ "$tok" -le 65535 ]; then
+                       printf '%s\n' "$tok"
+                       continue
+                   fi ;;
+            esac
+            log "пропускаю '$tok' в $file — не похоже на номер порта"
+        done
+    done < "$file"
+}
+
+# Переложить актуальный набор портов в $PORT_CHAIN с обеих сторон мостика.
 # Вызывается на КАЖДОМ запуске (в отличие от остальной настройки): IDE при
-# перезапуске занимает новый порт и оставляет новый lock-файл.
-sync_ide_ports() {
-    local p ports
-    ports=$(ide_ports | tr '\n' ' '); ports=${ports% }
-    iptables -t nat -F "$IDE_CHAIN"
-    ns_ipt   -t nat -F "$IDE_CHAIN"
+# перезапуске занимает новый порт и оставляет новый lock-файл, да и список в
+# $(ports_file) правится без участия скрипта.
+sync_ports() {
+    local p ide extra ports
+    ide=$(ide_ports)
+    extra=$(extra_ports)
+    # sort -un заодно снимает дубли, если порт есть и в lock-файлах, и в списке
+    ports=$(printf '%s\n%s\n' "$ide" "$extra" | grep . | sort -un | tr '\n' ' ')
+    ports=${ports% }
+    iptables -t nat -F "$PORT_CHAIN"
+    ns_ipt   -t nat -F "$PORT_CHAIN"
     for p in $ports; do
         # ns: на хостовый конец veth; хост: с него на свою настоящую петлю
-        ns_ipt   -t nat -A "$IDE_CHAIN" -p tcp --dport "$p" \
+        ns_ipt   -t nat -A "$PORT_CHAIN" -p tcp --dport "$p" \
             -j DNAT --to-destination "$VETH_HOST_IP:$p"
-        iptables -t nat -A "$IDE_CHAIN" -p tcp --dport "$p" \
+        iptables -t nat -A "$PORT_CHAIN" -p tcp --dport "$p" \
             -j DNAT --to-destination "127.0.0.1:$p"
     done
-    log "порты IDE из $(ide_lock_dir): ${ports:-(нет)}"
+    log "порты IDE из $(ide_lock_dir): $(fmt_ports "$ide")"
+    # про файл со списком молчим, когда его нет: вывод остаётся прежним
+    [ -f "$(ports_file)" ] && log "порты из $(ports_file): $(fmt_ports "$extra")"
+    return 0
 }
 
 # ---------------------- предусловия хостовой сети ----------------------------
@@ -305,7 +362,7 @@ ensure_setup() {
     local PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
 
     if is_ready; then
-        sync_ide_ports   # всё создано ранее, но набор портов IDE мог смениться
+        sync_ports   # всё создано ранее, но набор портов мог смениться
         return 0
     fi
 
@@ -374,11 +431,11 @@ ensure_setup() {
     ip netns exec "$NS_NAME" sh -c \
         "echo 1 > /proc/sys/net/ipv4/conf/$VETH_NS/route_localnet"
 
-    # 8. цепочки под порты IDE и переходы в них. Сами правила наполняет
-    #    sync_ide_ports ниже. Хостовый переход вставляем первым: в PREROUTING
+    # 8. цепочки под пробрасываемые порты и переходы в них. Сами правила наполняет
+    #    sync_ports ниже. Хостовый переход вставляем первым: в PREROUTING
     #    уже может сидеть DOCKER, и до него дело доходить не должно.
-    iptables -t nat -N "$IDE_CHAIN" 2>/dev/null || true
-    ns_ipt   -t nat -N "$IDE_CHAIN" 2>/dev/null || true
+    iptables -t nat -N "$PORT_CHAIN" 2>/dev/null || true
+    ns_ipt   -t nat -N "$PORT_CHAIN" 2>/dev/null || true
     ensure_rule iptables -I PREROUTING "${HOST_JUMP_SPEC[@]}"
     ensure_rule ns_ipt   -A OUTPUT     "${NS_JUMP_SPEC[@]}"
 
@@ -400,7 +457,7 @@ ensure_setup() {
     # Нужны ns-специфичные записи — положи /etc/netns/$NS_NAME/hosts руками.
 
     is_ready || die "настройка не завершилась, смотри 'vpn --status'"
-    sync_ide_ports
+    sync_ports
 }
 
 # --------------------------------- снос --------------------------------------
@@ -418,8 +475,8 @@ do_clean() {
         iptables -t nat -D PREROUTING ${rule#-A PREROUTING } 2>/dev/null || true
     done < <(iptables -t nat -S PREROUTING 2>/dev/null \
                 | grep -e "$VETH_HOST_IP" -e " $VETH_HOST ")
-    iptables -t nat -F "$IDE_CHAIN" 2>/dev/null || true
-    iptables -t nat -X "$IDE_CHAIN" 2>/dev/null || true
+    iptables -t nat -F "$PORT_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$PORT_CHAIN" 2>/dev/null || true
     ip link del "$VETH_HOST" 2>/dev/null || true   # уносит и $VETH_NS из ns
     # удаление ns автоматически возвращает физический интерфейс в основной ns
     # (без адресов и в состоянии DOWN — хостовая настройка, если она была,
@@ -458,13 +515,18 @@ do_status() {
     sudo ip netns exec "$NS_NAME" ip -br addr show dev "$VETH_NS" 2>/dev/null \
         || echo "  $VETH_NS не поднят"
     echo "  route_localnet($VETH_HOST): $(cat "/proc/sys/net/ipv4/conf/$VETH_HOST/route_localnet" 2>/dev/null || echo '?')"
-    echo "== порты IDE ($(ide_lock_dir)) =="
-    echo "  lock-файлы: $(ide_ports | tr '\n' ' ')"
+    echo "== пробрасываемые порты =="
+    echo "  lock-файлы IDE ($(ide_lock_dir)): $(fmt_ports "$(ide_ports)")"
+    if [ -f "$(ports_file)" ]; then
+        echo "  список ($(ports_file)): $(fmt_ports "$(extra_ports 2>/dev/null)")"
+    else
+        echo "  список ($(ports_file)): файла нет"
+    fi
     echo "  правила в ns:"
-    sudo ip netns exec "$NS_NAME" iptables -t nat -S "$IDE_CHAIN" 2>/dev/null \
+    sudo ip netns exec "$NS_NAME" iptables -t nat -S "$PORT_CHAIN" 2>/dev/null \
         | sed -n 's/^-A /    /p' | grep . || echo "    нет"
     echo "  правила на хосте:"
-    sudo iptables -t nat -S "$IDE_CHAIN" 2>/dev/null \
+    sudo iptables -t nat -S "$PORT_CHAIN" 2>/dev/null \
         | sed -n 's/^-A /    /p' | grep . || echo "    нет"
 }
 

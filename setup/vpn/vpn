@@ -15,6 +15,7 @@
 #     VPN_FORCE=1 vpn --ensure          забрать $IFACE, игнорируя проверку ниже
 #     VPN_IDE_LOCK_DIR=... vpn ...      другой каталог lock-файлов IDE
 #     VPN_PORTS_FILE=... vpn ...        другой файл со списком портов (см. ниже)
+#     VPN_HOSTS_FILE=... vpn ...        другой файл со списком хостов в обход vpn
 #
 # Скрипт сам уходит в основной ns хоста, если запущен из другого ns (например,
 # из 'vpn2' в setup/vpn-via-socks) — оборачивать в no-vpn не нужно.
@@ -57,6 +58,18 @@
 #   доверенная зона (там же сидят и отладочные, и служебные сокеты), и открывать
 #   её в ns ради пары портов незачем.
 #
+#   Обход vpn: хосты и адреса из $HOSTS_FILE (по умолчанию ~/.no-vpn-hosts
+#   вызвавшего пользователя) достижимы из ns мимо $IFACE — через ту же veth-пару
+#   и хостовую маршрутизацию:
+#       ns:   маршрут <адрес> via $VETH_HOST_IP (proto $BYPASS_PROTO)
+#       хост: FORWARD из veth только на эти адреса + MASQUERADE на выходе
+#   Имена резолвятся в ВСЕ IPv4-адреса (getent ahostsv4) дважды — хостовым
+#   резолвером и резолвером ns: DNS за VPN и хостовый DNS могут отдавать разные
+#   наборы, а приложение в ns спросит именно свой. Резолвинг повторяется на каждом
+#   запуске vpn — у долгоживущих процессов при смене адресов нужен 'vpn --ensure'.
+#   Только IPv4: у ns нет IPv6-маршрутов, AAAA-адреса отваливаются мгновенно и
+#   клиенты уходят на IPv4.
+#
 # Скрипт идемпотентен: при повторных запусках уже созданный ns и настроенный
 # интерфейс обнаруживаются и НЕ пересоздаются. За собой ничего не чистит —
 # для сноса есть --clean.
@@ -92,12 +105,26 @@ PORT_CHAIN="VPN_IDE"
 IDE_LOCK_DIR="${VPN_IDE_LOCK_DIR:-}"
 PORTS_FILE="${VPN_PORTS_FILE:-}"
 
+# --- обход vpn для адресов из $HOSTS_FILE ---
+HOSTS_FILE="${VPN_HOSTS_FILE:-}"
+# Хостовая filter-цепочка: какие адреса ns может достать через хост. Как и
+# $PORT_CHAIN, пересобирается целиком на каждом запуске.
+BYPASS_CHAIN="VPN_BYPASS"
+# Метка (protocol) маршрутов обхода в ns: по ней отличаем свои маршруты от прочих
+# и доудаляем исчезнувшие из списка.
+BYPASS_PROTO="222"
+# Потолок на резолвинг одного имени: при лежащем DNS getent ждёт до 20 секунд.
+RESOLVE_TIMEOUT=5
+
 # Спецификации правил вынесены в переменные: одна и та же строка используется
 # и для проверки (-C), и для добавления, и для удаления в --clean.
 HOST_JUMP_SPEC=(-i "$VETH_HOST" -s "$VETH_NS_IP" -d "$VETH_HOST_IP" -j "$PORT_CHAIN")
 NS_JUMP_SPEC=(-d 127.0.0.1/32 -p tcp -j "$PORT_CHAIN")
 NS_SNAT_SPEC=(-o "$VETH_NS" -j SNAT --to-source "$VETH_NS_IP")
 NS_FWD_DROP_SPEC=(-o "$VETH_NS" -j DROP)
+HOST_BYPASS_IN_SPEC=(-i "$VETH_HOST" -j "$BYPASS_CHAIN")
+HOST_BYPASS_OUT_SPEC=(-o "$VETH_HOST" -j "$BYPASS_CHAIN")
+HOST_MASQ_SPEC=(-s "$VETH_NS_IP/32" ! -o "$VETH_HOST" -j MASQUERADE)
 
 # Сколько секунд ждать готовности хостовой сети перед тем, как забирать $IFACE.
 # Нужно только при раннем запуске (сразу после загрузки, пока NM не дошёл до
@@ -131,10 +158,11 @@ veth_host_up() { ip link show "$VETH_HOST" >/dev/null 2>&1; }
 veth_ns_up() { ip netns exec "$NS_NAME" ip link show "$VETH_NS" >/dev/null 2>&1; }
 
 # Добавить правило, если его ещё нет: "$1" — команда (iptables/ns_ipt),
-# "$2" — куда вставлять (-I/-A), "$3" — цепочка, дальше спецификация.
+# "$2" — таблица, "$3" — куда вставлять (-I/-A), "$4" — цепочка, дальше спецификация.
 ensure_rule() {
-    local cmd="$1" op="$2" chain="$3"; shift 3
-    "$cmd" -t nat -C "$chain" "$@" 2>/dev/null || "$cmd" -t nat "$op" "$chain" "$@"
+    local cmd="$1" table="$2" op="$3" chain="$4"; shift 4
+    "$cmd" -t "$table" -C "$chain" "$@" 2>/dev/null \
+        || "$cmd" -t "$table" "$op" "$chain" "$@"
 }
 
 # Всё ли уже создано и настроено ранее (вызывать из root). Если да — пропускаем.
@@ -155,6 +183,11 @@ is_ready() {
     iptables -t nat -C PREROUTING "${HOST_JUMP_SPEC[@]}" 2>/dev/null || return 1
     ns_ipt -t nat -C OUTPUT "${NS_JUMP_SPEC[@]}" 2>/dev/null || return 1
     ns_ipt -t nat -C POSTROUTING "${NS_SNAT_SPEC[@]}" 2>/dev/null || return 1
+    # обход vpn (сами адреса — в sync_bypass)
+    iptables -n -L "$BYPASS_CHAIN" >/dev/null 2>&1 || return 1
+    iptables -C FORWARD "${HOST_BYPASS_IN_SPEC[@]}" 2>/dev/null || return 1
+    iptables -C FORWARD "${HOST_BYPASS_OUT_SPEC[@]}" 2>/dev/null || return 1
+    iptables -t nat -C POSTROUTING "${HOST_MASQ_SPEC[@]}" 2>/dev/null || return 1
     return 0
 }
 
@@ -183,8 +216,14 @@ ports_file() {
     printf '%s/.no-vpn-ports' "$(caller_home)"
 }
 
-# Список портов (по одному в строке) одной строкой для вывода человеку.
-fmt_ports() {
+# Файл со списком хостов в обход vpn вызвавшего пользователя.
+hosts_file() {
+    [ -n "$HOSTS_FILE" ] && { printf '%s' "$HOSTS_FILE"; return 0; }
+    printf '%s/.no-vpn-hosts' "$(caller_home)"
+}
+
+# Список (по одному элементу в строке) одной строкой для вывода человеку.
+fmt_list() {
     local s
     s=$(printf '%s' "$1" | tr '\n' ' ')
     s=${s% }
@@ -248,9 +287,142 @@ sync_ports() {
         iptables -t nat -A "$PORT_CHAIN" -p tcp --dport "$p" \
             -j DNAT --to-destination "127.0.0.1:$p"
     done
-    log "порты IDE из $(ide_lock_dir): $(fmt_ports "$ide")"
+    log "порты IDE из $(ide_lock_dir): $(fmt_list "$ide")"
     # про файл со списком молчим, когда его нет: вывод остаётся прежним
-    [ -f "$(ports_file)" ] && log "порты из $(ports_file): $(fmt_ports "$extra")"
+    [ -f "$(ports_file)" ] && log "порты из $(ports_file): $(fmt_list "$extra")"
+    return 0
+}
+
+# ------------------------------ обход vpn -----------------------------------
+# IPv4-адрес или сеть a.b.c.d/len (len 1..32: /0 перебил бы default-маршрут ns).
+# Ведущие нули не допускаются: ip и iptables по-разному трактуют 010 (октал).
+is_ipv4_net() {
+    local o='(0|[1-9][0-9]{0,2})'
+    [[ $1 =~ ^$o\.$o\.$o\.$o(/([1-9][0-9]?))?$ ]] || return 1
+    local i
+    for i in 1 2 3 4; do
+        [ "${BASH_REMATCH[i]}" -le 255 ] || return 1
+    done
+    [ -z "${BASH_REMATCH[6]}" ] || [ "${BASH_REMATCH[6]}" -le 32 ]
+}
+
+# Все IPv4-адреса имени: объединение ответов хостового резолвера и резолвера ns
+# (у ns свой resolv.conf, и DNS за VPN может отдать другой набор). ahostsv4 идёт
+# через getaddrinfo, поэтому возвращает все A-записи, а не первую, и учитывает
+# /etc/hosts. Loopback отбрасывается: маршрут на него в ns смысла не имеет.
+resolve_all() {
+    local sudo=()
+    is_root || sudo=(sudo)
+    {
+        timeout "$RESOLVE_TIMEOUT" getent ahostsv4 "$1"
+        # нет ns (ещё не создан) — просто нет второго набора
+        "${sudo[@]}" timeout "$RESOLVE_TIMEOUT" \
+            ip netns exec "$NS_NAME" getent ahostsv4 "$1"
+    } 2>/dev/null | awk '$1 !~ /^127\./ {print $1}' \
+        | sort -u -t. -k1,1n -k2,2n -k3,3n -k4,4n
+}
+
+# Записи из $(hosts_file) — по строке на запись: "<запись> <адрес> <адрес>...".
+# У нерезолвящегося имени адресов нет, строка из одного слова. Формат файла тот
+# же, что у списка портов: разделители — пробелы, переводы строки, запятые;
+# всё после '#' — комментарий. Нет файла — нет и обхода.
+bypass_entries() {
+    local file line tok ips
+    file=$(hosts_file)
+    [ -f "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%%#*}
+        line=${line//,/ }
+        for tok in $line; do
+            if is_ipv4_net "$tok"; then
+                printf '%s %s\n' "$tok" "${tok%/32}"
+                continue
+            fi
+            case "$tok" in
+                *:*) log "пропускаю '$tok' в $file — обход vpn только для IPv4"
+                     continue ;;
+                *[!A-Za-z0-9._-]*|[.-]*)
+                     log "пропускаю '$tok' в $file — не адрес IPv4 и не имя хоста"
+                     continue ;;
+            esac
+            ips=$(resolve_all "$tok" | tr '\n' ' ')
+            printf '%s %s\n' "$tok" "${ips% }"
+        done
+    done < "$file"
+}
+
+# Включить IPv4-форвардинг на интерфейсе, если выключен. Ядро смотрит флаг
+# ВХОДНОГО интерфейса: для запросов это $VETH_HOST, для ответов — аплинк хоста.
+# Runtime, до перезагрузки; обычно уже включено (docker ставит ip_forward=1).
+ensure_forwarding() {
+    local f="/proc/sys/net/ipv4/conf/$1/forwarding"
+    [ -w "$f" ] || return 0
+    [ "$(cat "$f")" = "1" ] && return 0
+    log "включаю forwarding на $1 (runtime, до перезагрузки)"
+    echo 1 > "$f"
+}
+
+# Переложить актуальный набор адресов обхода: разрешения на хосте и маршруты в
+# ns. Как и sync_ports, вызывается на КАЖДОМ запуске: файл правится руками, а
+# адреса у имён меняются.
+sync_bypass() {
+    local entries addrs a dev devs="" have name ips
+    entries=$(bypass_entries)
+    addrs=$(printf '%s\n' "$entries" | cut -s -d' ' -f2- | tr ' ' '\n' | grep . | sort -u)
+
+    # 1. хост: цепочка заменяется атомарно (iptables-restore --noflush сбрасывает
+    #    объявленную пользовательскую цепочку) — без окна, где ответы уже
+    #    установленных соединений падали бы в политику FORWARD.
+    {
+        echo '*filter'
+        echo ":$BYPASS_CHAIN - [0:0]"
+        echo "-A $BYPASS_CHAIN -o $VETH_HOST -d $VETH_NS_IP/32 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+        for a in $addrs; do
+            echo "-A $BYPASS_CHAIN -i $VETH_HOST -s $VETH_NS_IP/32 -d $a -j ACCEPT"
+        done
+        # всё прочее через мостик не форвардим, какой бы ни была политика FORWARD
+        echo "-A $BYPASS_CHAIN -j DROP"
+        echo 'COMMIT'
+    } | iptables-restore --noflush || log "не удалось обновить цепочку $BYPASS_CHAIN"
+
+    if [ -n "$addrs" ]; then
+        ensure_forwarding "$VETH_HOST"
+        for a in $addrs; do
+            dev=$(ip -4 route get "${a%%/*}" 2>/dev/null \
+                | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)
+            case " $devs " in *" $dev "*) ;; *) devs="$devs $dev" ;; esac
+        done
+        for dev in $devs; do
+            [ "$dev" = "lo" ] || [ "$dev" = "$VETH_HOST" ] || ensure_forwarding "$dev"
+        done
+    fi
+
+    # 2. ns: сначала ставим актуальные маршруты, потом снимаем устаревшие —
+    #    replace не рвёт уже идущие соединения.
+    for a in $addrs; do
+        ip netns exec "$NS_NAME" ip route replace "$a" via "$VETH_HOST_IP" \
+            dev "$VETH_NS" proto "$BYPASS_PROTO" \
+            || log "не удалось поставить маршрут в обход vpn на $a"
+    done
+    have=$(ip netns exec "$NS_NAME" ip -4 route show proto "$BYPASS_PROTO" \
+        | awk '{print $1}')
+    for a in $have; do
+        printf '%s\n' "$addrs" | grep -qxF "$a" \
+            || ip netns exec "$NS_NAME" ip route del "$a" proto "$BYPASS_PROTO"
+    done
+
+    # про файл молчим, когда его нет: вывод остаётся прежним
+    [ -f "$(hosts_file)" ] || return 0
+    while read -r name ips; do
+        [ -n "$name" ] || continue
+        [ "$name" = "$ips" ] && continue      # адрес как есть — показывать нечего
+        if [ -n "$ips" ]; then
+            log "в обход vpn: $name -> $ips"
+        else
+            log "в обход vpn: $name не резолвится — пропускаю"
+        fi
+    done <<< "$entries"
+    log "в обход vpn из $(hosts_file): $(fmt_list "$addrs")"
     return 0
 }
 
@@ -363,6 +535,7 @@ ensure_setup() {
 
     if is_ready; then
         sync_ports   # всё создано ранее, но набор портов мог смениться
+        sync_bypass  # ...как и список хостов в обход vpn
         return 0
     fi
 
@@ -436,12 +609,12 @@ ensure_setup() {
     #    уже может сидеть DOCKER, и до него дело доходить не должно.
     iptables -t nat -N "$PORT_CHAIN" 2>/dev/null || true
     ns_ipt   -t nat -N "$PORT_CHAIN" 2>/dev/null || true
-    ensure_rule iptables -I PREROUTING "${HOST_JUMP_SPEC[@]}"
-    ensure_rule ns_ipt   -A OUTPUT     "${NS_JUMP_SPEC[@]}"
+    ensure_rule iptables nat -I PREROUTING "${HOST_JUMP_SPEC[@]}"
+    ensure_rule ns_ipt   nat -A OUTPUT     "${NS_JUMP_SPEC[@]}"
 
     #    NS: приложение могло явно забиндить исходящий сокет на 127.0.0.1 —
     #    переписываем источник, иначе пакет уйдёт с невалидным для veth адресом
-    ensure_rule ns_ipt -A POSTROUTING "${NS_SNAT_SPEC[@]}"
+    ensure_rule ns_ipt nat -A POSTROUTING "${NS_SNAT_SPEC[@]}"
 
     #    NS: транзит в мостик запрещён — чтобы соседи по VPN-сети не смогли
     #    достучаться до хостовой петли через ns, если кто-то включит ip_forward
@@ -456,11 +629,31 @@ ensure_setup() {
     # /etc/hosts намеренно не трогаем: в ns виден настоящий хостовый файл.
     # Нужны ns-специфичные записи — положи /etc/netns/$NS_NAME/hosts руками.
 
+    # 9. обход vpn: хост форвардит из мостика (что именно — решает $BYPASS_CHAIN,
+    #    её наполняет sync_bypass) и маскирует ns-адрес на выходе. Переходы в
+    #    FORWARD вставляем первыми: у docker политика FORWARD — DROP.
+    iptables -N "$BYPASS_CHAIN" 2>/dev/null || true
+    ensure_rule iptables filter -I FORWARD     "${HOST_BYPASS_IN_SPEC[@]}"
+    ensure_rule iptables filter -I FORWARD     "${HOST_BYPASS_OUT_SPEC[@]}"
+    ensure_rule iptables nat    -A POSTROUTING "${HOST_MASQ_SPEC[@]}"
+
     is_ready || die "настройка не завершилась, смотри 'vpn --status'"
     sync_ports
+    sync_bypass
 }
 
 # --------------------------------- снос --------------------------------------
+# Снять все хостовые правила цепочки "$2" таблицы "$1", в которых grep (аргументы
+# после второго) находит совпадение.
+del_rules_matching() {
+    local table="$1" chain="$2" rule; shift 2
+    while read -r rule; do
+        [ -n "$rule" ] || continue
+        # shellcheck disable=SC2086  # спецификация правила должна разбиться на слова
+        iptables -t "$table" -D "$chain" ${rule#"-A $chain "} 2>/dev/null || true
+    done < <(iptables -t "$table" -S "$chain" 2>/dev/null | grep "$@")
+}
+
 do_clean() {
     is_root || die "do_clean должен выполняться от root"
     local PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
@@ -468,15 +661,16 @@ do_clean() {
     # Хостовая часть мостика. Снимаем ВСЕ правила PREROUTING, ссылающиеся на
     # хостовый конец veth: кроме нашего перехода туда могли попасть правила от
     # прежних версий скрипта. Правила внутри ns уезжают вместе с ним.
-    local rule
-    while read -r rule; do
-        [ -n "$rule" ] || continue
-        # shellcheck disable=SC2086  # спецификация правила должна разбиться на слова
-        iptables -t nat -D PREROUTING ${rule#-A PREROUTING } 2>/dev/null || true
-    done < <(iptables -t nat -S PREROUTING 2>/dev/null \
-                | grep -e "$VETH_HOST_IP" -e " $VETH_HOST ")
+    del_rules_matching nat PREROUTING -e "$VETH_HOST_IP" -e " $VETH_HOST "
+    # обход vpn: переходы в FORWARD и MASQUERADE
+    del_rules_matching filter FORWARD -e " $VETH_HOST "
+    del_rules_matching nat POSTROUTING -e "$VETH_NS_IP"
     iptables -t nat -F "$PORT_CHAIN" 2>/dev/null || true
     iptables -t nat -X "$PORT_CHAIN" 2>/dev/null || true
+    iptables -F "$BYPASS_CHAIN" 2>/dev/null || true
+    iptables -X "$BYPASS_CHAIN" 2>/dev/null || true
+    # forwarding на аплинке, если его включал sync_bypass, не выключаем: кроме
+    # нас он мог понадобиться кому-то ещё (docker и т.п.)
     ip link del "$VETH_HOST" 2>/dev/null || true   # уносит и $VETH_NS из ns
     # удаление ns автоматически возвращает физический интерфейс в основной ns
     # (без адресов и в состоянии DOWN — хостовая настройка, если она была,
@@ -516,9 +710,9 @@ do_status() {
         || echo "  $VETH_NS не поднят"
     echo "  route_localnet($VETH_HOST): $(cat "/proc/sys/net/ipv4/conf/$VETH_HOST/route_localnet" 2>/dev/null || echo '?')"
     echo "== пробрасываемые порты =="
-    echo "  lock-файлы IDE ($(ide_lock_dir)): $(fmt_ports "$(ide_ports)")"
+    echo "  lock-файлы IDE ($(ide_lock_dir)): $(fmt_list "$(ide_ports)")"
     if [ -f "$(ports_file)" ]; then
-        echo "  список ($(ports_file)): $(fmt_ports "$(extra_ports 2>/dev/null)")"
+        echo "  список ($(ports_file)): $(fmt_list "$(extra_ports 2>/dev/null)")"
     else
         echo "  список ($(ports_file)): файла нет"
     fi
@@ -527,6 +721,21 @@ do_status() {
         | sed -n 's/^-A /    /p' | grep . || echo "    нет"
     echo "  правила на хосте:"
     sudo iptables -t nat -S "$PORT_CHAIN" 2>/dev/null \
+        | sed -n 's/^-A /    /p' | grep . || echo "    нет"
+    echo "== в обход vpn =="
+    if [ -f "$(hosts_file)" ]; then
+        echo "  список ($(hosts_file)):"
+        bypass_entries 2>/dev/null | while read -r name ips; do
+            echo "    $name: ${ips:-не резолвится}"
+        done | grep . || echo "    пусто"
+    else
+        echo "  список ($(hosts_file)): файла нет"
+    fi
+    echo "  маршруты в ns:"
+    sudo ip netns exec "$NS_NAME" ip -4 route show proto "$BYPASS_PROTO" 2>/dev/null \
+        | sed 's/^/    /' | grep . || echo "    нет"
+    echo "  правила на хосте:"
+    sudo iptables -S "$BYPASS_CHAIN" 2>/dev/null \
         | sed -n 's/^-A /    /p' | grep . || echo "    нет"
 }
 

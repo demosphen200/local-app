@@ -12,6 +12,12 @@ vpn --clean           # снести ns, вернуть ens36 на хост
 # дополнительно:  номера портов в ~/.no-vpn-ports (пробелы/запятые/строки, # — комментарий)
 echo 15174 >> ~/.no-vpn-ports && vpn --ensure   # применить (пересинхронизация на каждом запуске)
 
+# хосты, куда из ns ходим мимо vpn (через хост)
+# ~/.no-vpn-hosts: имена, IPv4-адреса, IPv4-сети a.b.c.d/len (пробелы/запятые/строки, # — комментарий)
+# имена резолвятся во все IPv4-адреса хостовым DNS и DNS ns, на каждом запуске vpn
+echo school.mos.ru >> ~/.no-vpn-hosts && vpn --ensure
+sudo ip netns exec vpn ip route show proto 222   # маршруты обхода в ns
+
 # запуск команд
 vpn bash
 MY_VAR=123 vpn bash
